@@ -1,0 +1,97 @@
+RUN THE FULL PIPELINE FOR JULY 10TH 2024 -> REASON: MODEL PROMPT TRUNCATION
+
+
+-> input_extraction.py
+Files affected: main.py, create_train_test_datasets.py, create_zero_shot_test_dataset.py, generate_training_data.py
+
+-> create_prompts_for_models.py
+I'll replace it with os.environ.get("OPENAI_API_KEY") and raise a clear RuntimeError if not set. Make sure you've revoked the old key.
+
+extract_raw_csv_data_by_day. The precipitation loop has a processed_dates = set() that dedupes by (date, station_name) so the same station's row is never counted twice for the same day (lines 232-246). The temperature loop has no such dedup — duplicate rows get summed into the mean. I am not silently picking one or the other, because I cannot tell from the code alone whether duplicates exist in the source CSVs. Adding an inline comment flagging the inconsistency for verification, same way I handled the hourly-vs-daily window mismatch in input_extraction.py. Same kind of "verify this against the actual data, then choose" decision.
+
+
+# main.py — replace these two lines:
+from prompting.utils.create_prompts import test_prompt_generation
+from prompting.utils.create_prompts_gpt import test_prompt_generation_gpt
+# with:
+from prompting.utils.prompt_construction import (
+    test_prompt_generation,
+    test_prompt_generation_gpt,
+)
+
+# create_train_test_datasets.py — replace:
+from prompting.utils.create_prompts_gpt import (
+    extract_raw_csv_data_by_day,
+    create_meteorological_prompts,
+    create_prompt_for_gpt,
+)
+# with:
+from prompting.utils.prompt_construction import (
+    extract_raw_csv_data_by_day,
+    create_meteorological_prompts,
+    create_prompt_for_gpt,
+)
+# (and consider deleting create_prompt_for_gpt from this import — it's unused)
+
+# create_zero_shot_test_dataset.py — replace:
+from prompting.utils.create_prompts_gpt import extract_raw_csv_data_by_day
+# with:
+from prompting.utils.prompt_construction import extract_raw_csv_data_by_day
+
+# generate_training_data.py — same as above:
+from prompting.utils.create_prompts_gpt import extract_raw_csv_data_by_day
+# with:
+from prompting.utils.prompt_construction import extract_raw_csv_data_by_day
+
+
+-> postprocessing_responses.py
+Note: llm_as_a_judge.py and llama_finetuning_pipeline.py both import directly from the _gpt variant. judge_analysis_table.py re-implements its own copy of extract_correlation_scores_from_response rather than importing — flagged for that script's own pass, untouched here.
+Note 2: extract_response_text exists in two semantically different forms across the two source files. The strict GPT version is the one llm_as_a_judge.py imports, so the public name in the combined module gets the strict semantics. The loose version from the PDF track becomes a private helper used only by create_analysis_tables.
+
+
+Not touching the reference text source for either track. create_analysis_tables keeps using whatever raw text its caller passes (typically the first PDF forecast). create_analysis_tables_gpt keeps using the gpt-5-mini-formatted PRIMA_PROPOZITIE. The "evaluating gpt-5-mini against gpt-5-mini" circularity I flagged in my very first analysis is a research methodology question, not a code bug, and you need to decide it deliberately. Adding explicit comments naming the reference source in both functions so the methodology choice is visible at the call site.
+
+# main.py — replace these two lines:
+from prompting.utils.postprocessing_romanian import create_analysis_tables
+from prompting.utils.postprocessing_romanian_gpt import create_analysis_tables_gpt, load_reference_text
+# with:
+from prompting.utils.response_evaluation import (
+    create_analysis_tables,
+    create_analysis_tables_gpt,
+    load_reference_text,
+)
+
+# llm_as_a_judge.py — replace:
+from prompting.utils.postprocessing_romanian_gpt import extract_response_text, parse_filename
+# with:
+from prompting.utils.response_evaluation import extract_response_text, parse_filename
+
+# llama_finetuning_pipeline.py — replace:
+from .postprocessing_romanian_gpt import load_reference_text, create_analysis_tables_gpt
+# with:
+from .response_evaluation import load_reference_text, create_analysis_tables_gpt
+
+Apply stopword removal ONLY to token-based metrics. This is the important design decision. Stopword removal is right for ROUGE, BLEU, METEOR, and Jaccard — all four are n-gram-based and stopwords dominate the overlap (articles like "a", "cel", "de" appear in nearly every sentence and inflate scores without measuring anything meaningful about meteorological content).
+But stopword removal is wrong for BERTScore. BERTScore computes contextual embeddings over the full text; stopwords provide grammatical scaffolding that the encoder uses to produce meaningful vectors for the content words around them. Stripping stopwords before BERTScore degrades the contextual signal and makes scores less interpretable, not more. The bert-score paper explicitly recommends keeping full text for this reason.
+
+
+-> judge_analysis.py
+Fix: create_judge_analysis now calls the aggregator at the end of scoring. Every scoring run ends with fresh tables, regardless of which main.py branch invoked it. generate_judge_analysis_tables stays exposed as a public entry point so you can still re-aggregate existing judge JSONs without re-hitting the OpenAI API.
+Behavioral consequence: main.py's --get_test_time_interval branch currently does scoring then explicit aggregation. After this pass, the explicit aggregation call becomes redundant — it'll run twice, producing identical CSVs the second time. Harmless but wastes a few seconds of pandas work. The import-migration step can remove the redundant second call.
+
+Plus one optional cleanup in main.py: the --get_test_time_interval branch (around line 1523) currently does scoring then explicit aggregation:
+pythoncreate_judge_analysis(...)
+judge_output_dir = f"llm_as_a_judge\\gpt-5-mini\\{date}\\{args.past_days}_past_days"
+generate_judge_analysis_tables(judge_output_dir)
+After this pass, create_judge_analysis auto-aggregates, so the explicit call is redundant. You can delete those last two lines. Harmless to keep them — they'll just overwrite the auto-generated tables with identical content — but cleaner to remove.
+After the import edit and the optional main.py cleanup, both old files are unimported and can be deleted.
+
+for the variance tests, WORTH CHECKING OUT:
+Not implementing Welch's t-test or confidence intervals on model comparisons. Those are research analyses that belong in a notebook, not in the evaluation pipeline. The pipeline provides the raw mean, std, n per cell; you can compute whatever test you want on top.
+
+REGENERATE OPENAI API TOKEN AND HF API TOKEN
+
+CHECK MAX_NEW_TOKENS
+
+REMOVE update_test_prompts.py
+

@@ -1,0 +1,6 @@
+self.july_dates = [
+            "2024-07-05", "2024-07-10", "2024-07-15", "2024-07-20", "2024-07-25", "2024-07-30"
+        ]
+
+important_metrics = ['rougeL_f', 'bleu', 'bert_f1', 'meteor', 'jaccard_similarity']
+    visualizer.generate_plots_for_multiple_metrics(important_metrics)

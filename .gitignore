@@ -1,0 +1,81 @@
+# Data files (CSV station data, JSON datasets, formatted diagnoses)
+*.csv
+*.json
+!requirements.txt
+
+# PDF source files
+date/
+
+# Model artifacts
+fine_tuned_llm/
+*.bin
+*.safetensors
+*.gguf
+
+# Generated outputs
+responses/
+results/
+prompts/
+llm_as_a_judge/
+formatted_diagnoses_*/
+plots/
+plots_llm_as_a_judge/
+fine_tuned_llm/
+
+# Ollama model list
+models_to_test.txt
+
+# Summary files
+*_summary.json
+analysis_dates.txt
+dates_*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+prompting.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.7z
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.rar
+*.gz
+*.bz2
+*.xz
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+
+# Backup files
+*.backup
+*.bak
