@@ -1,0 +1,9 @@
+llama3.1:70b-instruct-q4_K_S
+deepseek-r1:32b-qwen-distill-q4_K_M
+magistral:24b-small-2506-q4_K_M
+phi4-reasoning:14b-q4_K_M
+gemma3:27b-it-q4_K_M
+gpt-oss:latest
+qwen3:30b-a3b-instruct-2507-q4_K_M
+qwen3:30b-a3b-thinking-2507-q4_K_M
+llama3.1:8b-instruct-q4_K_M

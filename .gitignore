@@ -22,9 +22,6 @@ plots/
 plots_llm_as_a_judge/
 fine_tuned_llm/
 
-# Ollama model list
-models_to_test.txt
-
 # Summary files
 *_summary.json
 analysis_dates.txt
