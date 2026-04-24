@@ -16,12 +16,12 @@ Every module in `prompting/utils/` after the cleanup, with its provenance.
 | `config.py` | Calendar split (train/test dates), LoRA hyperparameters, Trainer args | Edited in place |
 | `input_extraction.py` | Extract weather data from CSVs and forecast text from PDFs | **New: combined** `extract_data_from_tables.py` + `extract_pdf_data.py` |
 | `prompt_construction.py` | Build system/user prompt pairs for both PDF-context and GPT-CoT tracks | **New: combined** `create_prompts.py` + `create_prompts_gpt.py` |
-| `ollama_inference.py` | Download and run inference against Ollama-hosted models | Renamed from `ollama_calls.py` |
+| `ollama_inference.py` | Download and run inference against Ollama-hosted models; auto-includes the QLoRA adapter (if present) on the same prompts | Renamed from `ollama_calls.py` |
 | `hf_inference.py` | Load a 4-bit quantized HF model and run inference | Edited in place |
 | `finetuning_pipeline.py` | QLoRA fine-tuning orchestrator (train + test + evaluate) | Renamed from `llama_finetuning_pipeline.py` |
 | `finetune_integration.py` | Thin CLI wrapper between `main.py` and `finetuning_pipeline.py` | Edited in place |
 | `response_evaluation.py` | Compute ROUGE/BLEU/METEOR/BERTScore/Jaccard against references | **New: combined** `postprocessing_romanian.py` + `postprocessing_romanian_gpt.py` |
-| `judge_evaluation.py` | LLM-as-a-judge scoring and aggregation tables | **New: combined** `llm_as_a_judge.py` + `judge_analysis_table.py` |
+| `judge_evaluation.py` | LLM-as-a-judge scoring and aggregation tables; accepts `output_dir` override so the fine-tuning pipeline can direct its zero-shot judge output into `fine_tuned_llm/` | **New: combined** `llm_as_a_judge.py` + `judge_analysis_table.py` |
 | `dataset_creation.py` | Generate `train_data.json`, `test_data.json`, `test_data_zero_shot.json` | **New: combined** `generate_training_data.py` + `create_train_test_datasets.py` + `create_zero_shot_test_dataset.py` |
 | `diagnoses_formatting.py` | Extract yearly PDF diagnoses and reformat via gpt-5-mini into 5-sentence structure | Renamed from `create_dataset.py` |
 | `model_select_gui.py` | GUI for interactive model selection | Untouched |
@@ -42,8 +42,9 @@ Files to delete (replaced by the modules above):
 ```
 conda activate meteollm          # Python 3.12.7
 
-# Step 1: Install PyTorch with CUDA 12.6 support (CPU-only will NOT work)
+# Step 1: Install PyTorch with CUDA 12.6 support 
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+python -c "import torch; assert torch.cuda.is_available(), 'CPU torch still installed'; print('OK:', torch.cuda.get_device_name(0))"
 
 # Step 2: Install remaining dependencies
 pip install -r requirements.txt --break-system-packages
@@ -52,18 +53,20 @@ pip install -r requirements.txt --break-system-packages
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('wordnet')"
 ```
 
-Verify CUDA is available:
+Required environment variables (set once, persisted in the Windows
+registry via `setx`):
 
 ```
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, device: {torch.cuda.get_device_name(0)}')"
+setx OPENAI_API_KEY "sk-..."     # prompt generation, judge analysis, diagnoses formatting
+setx HF_TOKEN       "hf_..."     # gated HF models (Llama 3.1); not needed for local fine-tuned models
 ```
 
-Required environment variables (set before running any pipeline step):
-
-```
-set OPENAI_API_KEY=sk-...        # for prompt generation, judge analysis, diagnoses formatting
-set HF_TOKEN=hf_...              # for gated HF models (Llama 3.1); not needed for local fine-tuned models
-```
+`setx` writes to `HKCU\Environment`, so the variables become available to
+**new** processes. Close and reopen your terminal (or editor) after
+running these once — the current shell is not updated. Verify with
+`echo %OPENAI_API_KEY%` (cmd) or `echo $OPENAI_API_KEY` (Git Bash). Do
+not commit a wrapper script: prior `set_keys.cmd` conventions have been
+removed from the repo to keep secrets out of the working tree.
 
 The previous codebase had these keys hardcoded in source files. All
 hardcoded keys have been removed and must be rotated in your OpenAI and
@@ -98,9 +101,20 @@ main.py --timestamp / --get_test_time_interval
     |
     +---> prompt generation --> prompts/{date}/{N}_past_days/
     +---> ollama_inference  --> responses/{date}/{N}_past_days/
+    |       (on the same prompts, if fine_tuned_llm/model/final_model/
+    |        exists, the QLoRA adapter is loaded via hf_inference and its
+    |        responses are written into the SAME responses/{date}/ folder
+    |        with model label "Llama-3.1-8B-Instruct-qlora")
     +---> response_evaluation --> results/{date}/{N}_past_days/
     +---> judge_evaluation    --> llm_as_a_judge/{judge}/{date}/{N}_past_days/
 ```
+
+The fine-tuned model therefore appears as just another row in every
+downstream CSV and plot whenever the adapter is present on disk — no
+manual merge step. The fine-tuning pipeline continues to produce its
+own zero-shot evaluation under `fine_tuned_llm/results/zero-shot/`
+(including a `judge/` subtree added in the latest cleanup), which the
+comparison plotter reads to isolate the training effect.
 
 
 ## Run scenarios
@@ -140,7 +154,13 @@ require an API key.
 ### 3. Single-date Ollama inference (PDF-context track)
 
 The original pipeline path. Extracts data for one date, generates prompts
-from both PDF forecasts and CSV station data, and runs inference.
+from both PDF forecasts and CSV station data, and runs inference against
+every model in `models_to_test.txt`. When `fine_tuned_llm/model/final_model/`
+exists on disk, the QLoRA adapter is **automatically loaded after the
+Ollama sweep** and run against the exact same prompts; its responses
+land in the same `responses/{date}/` folder under the model label
+`Llama-3.1-8B-Instruct-qlora`, so statistical and judge analyses pick
+it up with no extra flags or merge steps.
 
 ```
 # Generate prompts and test models
@@ -187,6 +207,14 @@ QLoRA fine-tuning of Llama 3.1 8B Instruct using the pre-generated
 dataset files. Requires `train_data.json` and `test_data.json` (or
 `test_data_zero_shot.json`) to exist.
 
+Scope note: this pipeline handles **training** and the **zero-shot
+generalization test**. The few-shot test against Ollama-format prompts
+is no longer produced here — it runs automatically inside
+`--test_models` whenever the adapter exists on disk (see scenario 3).
+The zero-shot track writes statistical metrics to
+`fine_tuned_llm/results/zero-shot/{date}/{N}_past_days/` and judge
+metrics under the same folder's `judge/analysis/` subtree.
+
 ```
 # Full pipeline: train + test (few-shot)
 python main.py --finetune --year 2024 --past_days 4
@@ -222,7 +250,8 @@ python main.py --finetune --year 2024 --past_days 4 --training_seed 43
 | `--n_judge_runs_per_response` | int | 1 | Judge analysis |
 | `--training_seed` | int | 42 | Fine-tuning training phase |
 | `--legacy_collator` | flag | off | Fine-tuning training phase |
-| `--num_ctx` | int | 16384 | Ollama inference |
+| `--num_ctx` | int | 16384 | Ollama inference, fine-tuning test phase (HF tokenizer truncation) |
+| `--num_predict` | int | 512 | Ollama inference, fine-tuning test phase (max output tokens) |
 
 All flags default to backward-compatible values. Passing none of them
 reproduces the behavior of the cleaned pipeline; the only behavioral
@@ -351,82 +380,135 @@ reproducible, seeded, format-matched pipeline run.
 ## Complete example: full evaluation run for July 2024
 
 The commands below produce a complete evaluation with 3-seed variance
-estimation for both Ollama models and the fine-tuned model, including
-combined plots.
+estimation for all Ollama models, the base `llama3.1:8b` reference, and
+the fine-tuned QLoRA adapter, plus a three-way comparison plot set.
 
-### Block A: Ollama models on July 10th
+Use `cmd.exe` (not Git Bash) so `setx`-persisted env vars are visible.
+Set a short Python alias once per session:
 
+```cmd
+cd /d F:\Claudiu\metframe
+set PY=C:\Users\sateliti1\AppData\Local\anaconda3\envs\meteollm\python.exe
 ```
+
+### Block A: Data preparation (one-time)
+
+```cmd
+REM Step 1 - PDF to diagnoses (skip if formatted_diagnoses_2024/formatted_diagnoses_2024.json already exists).
+REM This is the long step (~12h, calls gpt-5-mini per date).
+%PY% -u main.py --generate_training_dataset_for_year 2024 --judge gpt-5-mini
+
+REM Step 2 - produce train_data.json / test_data.json / test_data_zero_shot.json
+%PY% -u dataset_creation.py --mode all --year 2024 --past_days 4
+
+REM Verify the six held-out test dates are present in test_data.json.
+REM These are the 30th of Jan/Mar/May/Jul/Sep/Nov per config.get_testing_dates() —
+REM the dates the QLoRA model is evaluated on. File is UTF-8; encoding must
+REM be passed explicitly under Windows default cp1252.
+%PY% -c "import json; d=json.load(open('test_data.json', encoding='utf-8')); dates=sorted({x['date'] for x in d}); print('dates:', dates)"
+```
+
+Reminder: the calendar split in [config.py](prompting/utils/config.py)
+uses days 1-25 of every month for training and the 30th of
+Jan/Mar/May/Jul/Sep/Nov for held-out testing. Any date whose day number
+falls in 1-25 (e.g. July 10) is in the training set; evaluating the
+fine-tuned model on such a date measures memorization, not
+generalization, so the unified evaluation below runs only on the six
+held-out test dates.
+
+### Block B: Train the QLoRA adapter
+
+```cmd
 ollama serve
 
-python main.py --get_test_time_interval 2024-07-10 2024-07-10 --past_days 4 --download_models
-python main.py --get_test_time_interval 2024-07-10 2024-07-10 --past_days 4 --generate_prompts_gpt
-python main.py --get_test_time_interval 2024-07-10 2024-07-10 --past_days 4 --test_models --n_seeds 3
-python main.py --get_test_time_interval 2024-07-10 2024-07-10 --past_days 4 --statistical_analysis
-python main.py --get_test_time_interval 2024-07-10 2024-07-10 --past_days 4 --judge_analysis --n_judge_runs_per_response 3
+%PY% -u main.py --finetune --year 2024 --past_days 4 --skip_testing --training_seed 42
 ```
 
-Output: `responses/2024-07-10/`, `results/2024-07-10/`,
-`llm_as_a_judge/gpt-5-mini/2024-07-10/`.
+Output: `fine_tuned_llm/model/final_model/` (adapter weights). Once
+this folder exists, every subsequent `--test_models` run will
+automatically include the fine-tuned model alongside the Ollama ones.
 
-### Block B: Retrain and test the fine-tuned model
+### Block C: Unified few-shot evaluation on the six held-out dates
 
-The fine-tuned model tests on the six dates defined in `config.py`
-(30th of January, March, May, July, September, November). This block
-retrains from scratch with the cleaned pipeline and then runs inference.
+Runs the Ollama models + the QLoRA adapter (auto-included by
+`--test_models` now that the adapter exists on disk) on each of the
+six held-out config dates, using the matching prompts in
+`prompts/{date}/`. `cmd.exe`'s `for %d in (...)` syntax iterates the
+dates per phase so the model download happens once and each phase
+finishes across all dates before the next begins.
 
-```
-python dataset_creation.py --mode all --year 2024 --past_days 4
-python main.py --finetune --year 2024 --past_days 4 --skip_testing
-python main.py --finetune --year 2024 --past_days 4 --skip_training --n_seeds 3
-```
+```cmd
+REM One-time: download every model in models_to_test.txt. Idempotent —
+REM already-pulled models are skipped.
+%PY% -u main.py --get_test_time_interval 2024-01-30 2024-01-30 --past_days 4 --download_models
 
-Output: `fine_tuned_llm/model/final_model/` (adapter weights),
-`fine_tuned_llm/responses/few-shot/` and `fine_tuned_llm/results/few-shot/`
-for each of the six test dates.
+REM Phase 1: generate prompts for every test date.
+for %d in (2024-01-30 2024-03-30 2024-05-30 2024-07-30 2024-09-30 2024-11-30) do %PY% -u main.py --get_test_time_interval %d %d --past_days 4 --generate_prompts_gpt
 
-### Block C: Combine both pipelines on July 30th
+REM Phase 2: run inference. Every Ollama model + the QLoRA adapter, all seeds, all past_days.
+for %d in (2024-01-30 2024-03-30 2024-05-30 2024-07-30 2024-09-30 2024-11-30) do %PY% -u main.py --get_test_time_interval %d %d --past_days 4 --test_models --n_seeds 3 --num_ctx 16384 --num_predict 1024
 
-To get both Ollama models and the fine-tuned model in the same CSVs and
-plots, run Ollama on July 30th, merge the fine-tuned responses into the
-Ollama responses folder, and re-evaluate.
+REM Phase 3: statistical analysis.
+for %d in (2024-01-30 2024-03-30 2024-05-30 2024-07-30 2024-09-30 2024-11-30) do %PY% -u main.py --get_test_time_interval %d %d --past_days 4 --statistical_analysis
 
-```
-python main.py --get_test_time_interval 2024-07-30 2024-07-30 --past_days 4 --test_models --n_seeds 3
-xcopy /S /Y fine_tuned_llm\responses\few-shot\2024-07-30\4_past_days\*.json responses\2024-07-30\4_past_days\
-python main.py --get_test_time_interval 2024-07-30 2024-07-30 --past_days 4 --statistical_analysis
-python main.py --get_test_time_interval 2024-07-30 2024-07-30 --past_days 4 --judge_analysis --n_judge_runs_per_response 3
-```
-
-Output: `results/2024-07-30/` and `llm_as_a_judge/gpt-5-mini/2024-07-30/`
-now contain both Ollama and fine-tuned model rows.
-
-### Block D: Generate plots
-
-```
-python generate_metric_plots.py
-python generate_plots_llm_as_a_judge.py
+REM Phase 4: LLM-as-a-judge analysis with 3 judge runs per response for variance.
+for %d in (2024-01-30 2024-03-30 2024-05-30 2024-07-30 2024-09-30 2024-11-30) do %PY% -u main.py --get_test_time_interval %d %d --past_days 4 --judge_analysis --n_judge_runs_per_response 3
 ```
 
-Output: `plots/` and `plots_llm_as_a_judge/`.
+Output (per date): `responses/{date}/`, `results/{date}/`,
+`llm_as_a_judge/gpt-5-mini/{date}/` — all containing both Ollama models
+(with the Q4_K_M base `llama3.1:8b-instruct-q4_K_M` acting as the
+untrained reference) and the fine-tuned row
+`Llama-3.1-8B-Instruct-qlora`.
 
-### Date coverage observation
+Rough compute envelope: ~9 Ollama models × 4 past_days × 3 seeds × 30 s
+per response + the QLoRA sweep + the judge calls ≈ 2-3 hours per date
+on an RTX A6000. The full six-date sweep therefore runs overnight.
 
-The fine-tuned model can only be evaluated on the six dates in
-`config.get_testing_dates()` because those are the dates for which
-`test_data.json` contains prompts. The cleaned pipeline raises a hard
-`ValueError` if you request a date not present in the test data (the
-previous pipeline silently substituted the closest available date,
-producing mislabeled results).
+### Block D: Zero-shot fine-tuned evaluation (for the comparison plot)
 
-This means:
+The zero-shot track runs on all six held-out config dates and now
+sweeps past_days 1..4 internally (one inference per (date, past_days,
+seed) cell). Responses, statistical metrics, and judge metrics all
+land under `fine_tuned_llm/results/zero-shot/`.
 
-- **On the six config dates (Jan/Mar/May/Jul/Sep/Nov 30th):** full
-  comparison between all Ollama models and `Llama-3.1-8B-Instruct-qlora`
-  in the same plots.
-- **On any other date (e.g., July 10th):** Ollama models only.
+```cmd
+%PY% -u main.py --finetune --year 2024 --past_days 4 --skip_training --zero_shot --n_seeds 3 --num_ctx 16384 --num_predict 1024
+```
 
-To add the fine-tuned model to an arbitrary date, either modify
-`config.get_testing_dates()` to include that date before running
-`dataset_creation.py --mode few_shot_test`, or manually append an entry
-to `test_data.json` with the correct prompt format.
+### Block E: Plots
+
+```cmd
+%PY% -u generate_metric_plots.py
+%PY% -u generate_plots_llm_as_a_judge.py
+%PY% -u generate_comparison_plots.py
+```
+
+Output:
+- `plots/` and `plots_llm_as_a_judge/` — all 10 rows per date (9 Ollama + QLoRA) with variance error bars across every metric.
+- `plots_comparison/` — three-series focused comparison (fine-tuned few-shot vs fine-tuned zero-shot vs base `llama3.1:8b` Q4_K_M) for both statistical metrics and the judge score. Includes a Q4_K_M vs NF4+bf16 quantization footnote on each figure.
+
+### Date coverage notes
+
+| Track | Dates available | Gating file |
+|---|---|---|
+| Ollama few-shot | Any date with CSV data, past_days sweep 1..N | `prompts/{date}/` (generated on demand) |
+| Fine-tuned few-shot (unified) | Same as Ollama — wherever `--test_models` runs | `fine_tuned_llm/model/final_model/` must exist |
+| Fine-tuned zero-shot | Six dates in `config.get_testing_dates()`, past_days sweep 1..N | `test_data_zero_shot.json` (now contains one entry per (date, past_days) pair) |
+
+The fine-tuned few-shot track is no longer restricted to `config` dates
+because it now reads prompts from `prompts/{date}/`, the same source as
+the Ollama models. Only the zero-shot track remains bound to the
+`test_data_zero_shot.json` date set, but within those dates it now
+sweeps the full past_days axis 1..N (one entry per (date, past_days)
+pair), so its line on the comparison plot spans the same x-range as
+the few-shot curves instead of being a single point. On dates outside
+the zero-shot set the third series is simply absent from the plot.
+
+Caveat about the sweep interpretation: increasing past_days in the
+zero-shot track does not turn it into few-shot. The prompt body grows
+with more raw numerical history (weather readings for additional past
+days) but still contains zero worked examples of the diagnosis task —
+no reference diagnoses, no reasoning chains. What the sweep measures is
+whether the model can leverage longer numerical trends when making
+comparative statements, independent of in-context exemplars.

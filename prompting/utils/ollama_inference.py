@@ -1115,7 +1115,20 @@ def download_models_only(
     immediately unload the model from VRAM so the next pull can proceed
     without VRAM contention. Models remain cached on disk.
     """
+    models_dir = os.environ.get("OLLAMA_MODELS") or str(Path.home() / ".ollama" / "models")
+    print(f"[trace] Ollama models directory: {models_dir} "
+          f"(source: {'OLLAMA_MODELS env var' if os.environ.get('OLLAMA_MODELS') else 'default ~/.ollama/models'})")
     print(f"Downloading {len(models_list)} models")
+
+    downloaded_log_path = Path("downloaded_models.txt")
+    already_downloaded: List[str] = []
+    if downloaded_log_path.exists():
+        already_downloaded = [
+            line.strip() for line in downloaded_log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    print(f"[trace] Progress log: {downloaded_log_path.resolve()} "
+          f"({len(already_downloaded)} already recorded)")
 
     successful: List[str] = []
     failed: List[str] = []
@@ -1136,6 +1149,12 @@ def download_models_only(
             if not _unload_model_from_memory(model_name, ollama_url):
                 print(f"WARNING: {model_name} downloaded but could not be unloaded from VRAM")
             successful.append(model_name)
+            if model_name not in already_downloaded:
+                already_downloaded.append(model_name)
+                with open(downloaded_log_path, "w", encoding="utf-8") as f:
+                    for name in already_downloaded:
+                        f.write(f"{name}\n")
+                print(f"[trace] Recorded {model_name} in {downloaded_log_path.name}")
         else:
             failed.append(model_name)
 
@@ -1294,4 +1313,124 @@ def test_downloaded_models(
     )
 
     _print_prompt_token_summary(token_usage_log, num_ctx, model_num_ctx_overrides)
-    
+
+    # Auto-include the fine-tuned QLoRA model, if present on disk, in the
+    # same responses/ folder. This makes the fine-tuned model appear as just
+    # another row in every downstream CSV and plot, alongside the Ollama
+    # models, with zero manual merging.
+    _test_finetuned_on_ollama_prompts(
+        base_date=base_date,
+        past_days_max=past_days,
+        prompts_dir=prompts_dir,
+        responses_dir=responses_dir,
+        seeds=seed_list,
+        num_ctx=num_ctx,
+        num_predict=num_predict,
+        temperature=temperature,
+        top_p=top_p,
+        include_seed_in_filename=include_seed_in_filename,
+    )
+
+
+_FINETUNED_ADAPTER_DIR = Path("fine_tuned_llm") / "model" / "final_model"
+_FINETUNED_MODEL_LABEL = "Llama-3.1-8B-Instruct-qlora"
+
+
+def _test_finetuned_on_ollama_prompts(
+    base_date: str,
+    past_days_max: int,
+    prompts_dir: Path,
+    responses_dir: Path,
+    seeds: List[int],
+    num_ctx: int,
+    num_predict: int,
+    temperature: float,
+    top_p: float,
+    include_seed_in_filename: bool,
+) -> None:
+    """
+    If a fine-tuned QLoRA adapter exists on disk, run it against the same
+    prompts the Ollama models just consumed and write responses into the
+    same responses/ folder so downstream analysis picks it up as another
+    row. Silently no-ops when the adapter is absent.
+
+    Imports HuggingFaceInference lazily so the heavy transformers/peft
+    stack is not loaded for Ollama-only runs.
+    """
+    if not _FINETUNED_ADAPTER_DIR.exists():
+        return
+
+    system_prompt = _load_system_prompt(prompts_dir, base_date)
+    if system_prompt is None:
+        print(
+            f"WARNING: skipping fine-tuned model for {base_date}; "
+            "system prompt not found"
+        )
+        return
+
+    try:
+        from prompting.utils.hf_inference import HuggingFaceInference
+    except Exception as e:
+        print(f"WARNING: cannot import HuggingFaceInference; skipping fine-tuned: {e}")
+        return
+
+    print(
+        f"\nTesting fine-tuned model {_FINETUNED_MODEL_LABEL} "
+        f"(num_ctx={num_ctx}, seeds={seeds})"
+    )
+
+    engine = HuggingFaceInference(str(_FINETUNED_ADAPTER_DIR), max_length=num_ctx)
+    if not engine.load_model():
+        print("ERROR: failed to load fine-tuned model; skipping")
+        return
+
+    successes = 0
+    try:
+        for current_past_days in range(past_days_max, 0, -1):
+            user_prompt = _load_user_prompt(prompts_dir, base_date, current_past_days)
+            if user_prompt is None:
+                continue
+
+            for seed in seeds:
+                response_data = engine.generate_response(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    seed=seed,
+                    num_predict=num_predict,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                if "error" in response_data:
+                    print(
+                        f"ERROR: fine-tuned generation failed pd={current_past_days} "
+                        f"seed={seed}: {response_data['error']}"
+                    )
+                    continue
+
+                filename = _save_response_json(
+                    responses_dir=responses_dir,
+                    model_name=_FINETUNED_MODEL_LABEL,
+                    base_date=base_date,
+                    past_days=current_past_days,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_data=response_data,
+                    seed=seed,
+                    num_ctx=num_ctx,
+                    num_predict=num_predict,
+                    temperature=temperature,
+                    top_p=top_p,
+                    include_seed_in_filename=include_seed_in_filename,
+                )
+                successes += 1
+                duration_s = response_data.get("total_duration", 0) / 1e9
+                print(
+                    f"  {_FINETUNED_MODEL_LABEL} pd={current_past_days} seed={seed}: "
+                    f"duration={duration_s:.1f}s, saved {filename}"
+                )
+    finally:
+        engine.unload_model()
+
+    print(
+        f"Fine-tuned model complete: {successes} responses written to {responses_dir}"
+    )

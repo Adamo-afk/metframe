@@ -1834,6 +1834,15 @@ parser.add_argument(
          'Default 16384 avoids the silent truncation at 4096 that '
          'corrupted prior experiments (default: 16384)'
 )
+parser.add_argument(
+    '--num_predict',
+    type=int,
+    default=512,
+    help='Max new output tokens per response (both Ollama and '
+         'fine-tuned HF inference). Default 512 covers the 5-sentence '
+         'diagnosis format with headroom. Raise if outputs are being '
+         'cut off mid-sentence (default: 512)'
+)
 args = parser.parse_args()
 
 
@@ -2867,9 +2876,17 @@ def generate_analysis_dates(date_range: Tuple[str, str], past_days: int, output_
         raise ValueError(f"Invalid date format. Use yyyy-mm-dd format. Error: {e}")
     
     # Validate date range
-    if start_date >= end_date:
-        raise ValueError("Start date must be before end date")
-    
+    if start_date > end_date:
+        raise ValueError("Start date must not be after end date")
+
+    # Single-date case: skip interval generation and return that one date.
+    # The downstream check_data_availability() call verifies past_days of
+    # history exist before actually running any analysis.
+    if start_date == end_date:
+        single = start_date.strftime("%Y-%m-%d")
+        print(f"Single-date interval: analyzing {single}")
+        return [single]
+
     # Calculate first analysis date
     first_analysis_date = start_date + timedelta(days=past_days)
     
@@ -2983,6 +3000,16 @@ if __name__ == "__main__":
         else:
             print("ERROR: weather code processing failed")
 
+    elif args.download_models and args.timestamp is None and args.get_test_time_interval is None:
+        # Standalone download: no timestamp required
+        if not os.path.exists("models_to_test.txt"):
+            print("ERROR: models_to_test.txt not found")
+        else:
+            with open("models_to_test.txt", "r") as f:
+                models_to_test = [model.strip() for model in f.readlines() if model.strip()]
+            print(f"Models to download: {models_to_test}")
+            download_models_only(models_to_test)
+
     elif args.timestamp is not None and args.past_days is not None:
         # Single-date branch (PDF-context track)
         result = check_data_availability(args.timestamp, args.past_days)
@@ -3047,6 +3074,7 @@ if __name__ == "__main__":
                         keep_alive="10m",
                         n_seeds=args.n_seeds,
                         num_ctx=args.num_ctx,
+                        num_predict=args.num_predict,
                     )
 
                 elif args.statistical_analysis:
@@ -3117,6 +3145,7 @@ if __name__ == "__main__":
                         keep_alive="30m",
                         n_seeds=args.n_seeds,
                         num_ctx=args.num_ctx,
+                        num_predict=args.num_predict,
                     )
 
                 elif args.statistical_analysis:

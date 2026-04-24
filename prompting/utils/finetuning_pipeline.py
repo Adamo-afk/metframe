@@ -715,6 +715,7 @@ from datasets import Dataset
 
 from prompting.utils.hf_inference import HuggingFaceInference
 from prompting.utils.config import get_model_config, get_training_config
+from prompting.utils.judge_evaluation import create_judge_analysis
 from prompting.utils.response_evaluation import (
     create_analysis_tables_gpt,
     load_reference_text,
@@ -872,6 +873,8 @@ class MeteorologyFineTuner:
         zero_shot: bool = False,
         n_seeds: int = 1,
         seeds: Optional[List[int]] = None,
+        num_predict: int = 512,
+        num_ctx: int = 16384,
         year: Optional[int] = None,  # accepted for backwards-compat; unused
     ) -> bool:
         """
@@ -926,12 +929,26 @@ class MeteorologyFineTuner:
 
         # Phase 3: Testing
         if not skip_testing:
-            print(f"Phase 3: testing model ({approach})")
+            # Zero-shot track sweeps past_days 1..N so the eval x-axis
+            # matches the few-shot / Ollama plots. Few-shot track runs at
+            # the single requested past_days (the unified pipeline via
+            # --test_models is where the few-shot past_days sweep lives).
+            past_days_values = (
+                list(range(1, past_days + 1)) if zero_shot else [past_days]
+            )
+            print(
+                f"Phase 3: testing model ({approach}, "
+                f"past_days sweep={past_days_values})"
+            )
             self._test_model_with_hf(
                 testing_data, past_days, zero_shot,
-                n_seeds=n_seeds, seeds=seeds,
+                n_seeds=n_seeds, seeds=seeds, num_predict=num_predict,
+                num_ctx=num_ctx, past_days_values=past_days_values,
             )
-            self._evaluate_model_performance(testing_data, past_days, zero_shot)
+            self._evaluate_model_performance(
+                testing_data, past_days, zero_shot,
+                past_days_values=past_days_values,
+            )
             print(f"{approach} testing and evaluation complete")
 
         print("Pipeline finished successfully")
@@ -1156,11 +1173,40 @@ class MeteorologyFineTuner:
                 torch_dtype=self.torch_dtype,
                 device_map="auto",
                 quantization_config=bnb_config,
+                # SDPA uses PyTorch's memory-efficient attention kernel
+                # (tiled computation, no full n^2 materialization). Without
+                # this, at seq_len=16384 the eager attention path allocates
+                # a single ~32-48 GB tensor per forward and OOMs the A6000
+                # even at batch=2. SDPA is bundled with modern torch; no
+                # extra dependency required.
+                attn_implementation="sdpa",
             )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load model {self.model_name}: {e}"
             )
+
+        # Training with gradient checkpointing requires use_cache=False,
+        # otherwise the KV cache interacts with the re-entrant activation
+        # recomputation and silently inflates VRAM. peft enables gradient
+        # checkpointing on the model but does not touch this flag.
+        self.model.config.use_cache = False
+
+        # Force SDPA post-load. The attn_implementation kwarg on
+        # from_pretrained is sometimes silently dropped for 4-bit bnb
+        # models, leaving eager attention active. Eager materializes the
+        # full n^2 attention matrix, which OOMs at seq_len=16384 even at
+        # batch=1 on a 48 GB A6000 (32 GB for the q@k.T result alone,
+        # plus an fp32 softmax intermediate). SDPA tiles the computation
+        # via flash/mem-efficient kernels and keeps working memory linear
+        # in seq_len. set_attn_implementation propagates to every
+        # attention module via the config.
+        try:
+            self.model.set_attn_implementation("sdpa")
+        except Exception as e:
+            print(f"WARNING: could not force SDPA post-load: {e}")
+        actual_impl = getattr(self.model.config, "_attn_implementation", "unknown")
+        print(f"Attention implementation in use: {actual_impl}")
 
         # Attach LoRA adapter from config.py settings
         model_config = get_model_config()
@@ -1247,12 +1293,22 @@ class MeteorologyFineTuner:
                 mlm=False,
             )
 
-        # The response template marks where the assistant turn begins;
-        # everything before the first occurrence in each example is masked
-        # to -100. This is Llama 3.1 instruct format; if you switch base
-        # models, update _LLAMA_RESPONSE_TEMPLATE accordingly.
+        # Pre-tokenize the response template *with a leading newline* and
+        # drop the first token. This defeats a common BPE gotcha: when the
+        # template is tokenized in isolation, the tokenizer may merge the
+        # leading "<" with a prefix byte or emit a leading-space token,
+        # producing IDs that don't appear in the in-context tokenization.
+        # Tokenizing with a leading newline forces the template to start
+        # at a fresh token boundary; dropping the newline's token ID
+        # leaves exactly the IDs that appear in the actual training sequences.
+        # Without this, the collator fails to find the boundary and masks
+        # every label to -100 ("This instance will be ignored in loss
+        # calculation" warnings) for most or all examples.
+        response_ids = self.tokenizer.encode(
+            "\n" + _LLAMA_RESPONSE_TEMPLATE, add_special_tokens=False
+        )[1:]
         return DataCollatorForCompletionOnlyLM(
-            response_template=_LLAMA_RESPONSE_TEMPLATE,
+            response_template=response_ids,
             tokenizer=self.tokenizer,
         )
 
@@ -1276,13 +1332,19 @@ class MeteorologyFineTuner:
             gradient_accumulation_steps=training_config["gradient_accumulation_steps"],
             num_train_epochs=training_config["num_train_epochs"],
             learning_rate=training_config["learning_rate"],
-            warmup_steps=training_config["warmup_steps"],
+            warmup_ratio=training_config["warmup_ratio"],
             bf16=use_bf16,
             fp16=use_fp16,
             dataloader_num_workers=4,
             dataloader_pin_memory=True,
             remove_unused_columns=False,
             group_by_length=True,
+            # Make gradient checkpointing explicit at the Trainer level so
+            # it's guaranteed on regardless of what peft did to the model.
+            # use_reentrant=False is the modern path; the legacy reentrant
+            # variant conflicts with LoRA adapter gradient flow.
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=training_config["logging_steps"],
             save_steps=training_config["save_steps"],
             save_total_limit=training_config["save_total_limit"],
@@ -1438,49 +1500,60 @@ class MeteorologyFineTuner:
         zero_shot: bool,
         n_seeds: int = 1,
         seeds: Optional[List[int]] = None,
+        num_predict: int = 512,
+        num_ctx: int = 16384,
+        past_days_values: Optional[List[int]] = None,
     ) -> None:
         """
         Test the fine-tuned model across all dates in testing_data.
 
-        Lifecycle change from the previous pipeline: the model is loaded
-        ONCE at the start and unloaded ONCE at the end, instead of being
-        loaded and unloaded per date. For 30 dates this saves ~2 minutes
-        of model load time per run, and matches the per-model lifecycle
-        in ollama_inference.py.
+        Lifecycle: the model is loaded ONCE and unloaded ONCE around the
+        full sweep (all dates, seeds, and past_days values).
 
-        Multi-seed mode: when n_seeds>1 (or seeds is passed explicitly),
-        each (date) cell produces multiple responses with different seeds,
-        each saved as a separate JSON with _seed{N} in the filename.
-        Filename format matches what response_evaluation.parse_filename_with_seed
-        expects, so analysis/aggregation works without extra configuration.
+        past_days_values controls the past_days axis:
+          - None (default): test only at the single value given by the
+            `past_days` kwarg. Backwards-compatible.
+          - [1, ..., N]: sweep multiple past_days values, generating one
+            response per (date, past_days, seed) cell. Used by the
+            zero-shot track so its x-axis matches the Ollama / few-shot
+            plots instead of being a single point at the largest value.
+
+        Multi-seed mode unchanged: n_seeds>1 suffixes _seed{N} into every
+        filename so response_evaluation.parse_filename_with_seed picks up
+        the variance data without configuration.
         """
         approach = _approach_label(zero_shot)
         seed_list = _resolve_seeds(n_seeds, seeds)
         include_seed_in_filename = len(seed_list) > 1
+        sweep_values = past_days_values if past_days_values else [past_days]
 
         model_path = str(self.output_dir / _MODEL_SUBDIR / _FINAL_MODEL_NAME)
         if not Path(model_path).exists():
             print(f"ERROR: model not found at {model_path}")
             return
 
-        # Validate and write prompts BEFORE attempting any model load.
-        # This raises ValueError early if past_days is unavailable.
+        # Validate and write prompts for every past_days value BEFORE
+        # loading the model, so any missing past_days in testing_data
+        # fails fast without paying the model-load cost.
+        items_per_past_days: Dict[int, List[Tuple[str, Dict]]] = {}
         try:
-            selected_items = self._prepare_testing_prompts(
-                testing_data, past_days, zero_shot,
-            )
+            for pd_val in sweep_values:
+                items_per_past_days[pd_val] = self._prepare_testing_prompts(
+                    testing_data, pd_val, zero_shot,
+                )
         except ValueError as e:
             print(f"ERROR: {e}")
             return
 
         seed_desc = f"seed={seed_list[0]}" if len(seed_list) == 1 else f"seeds={seed_list}"
+        total_cells = sum(len(v) for v in items_per_past_days.values()) * len(seed_list)
         print(
-            f"Testing {approach} for {len(selected_items)} dates "
-            f"(past_days={past_days}, {seed_desc})"
+            f"Testing {approach}: past_days sweep {sweep_values}, "
+            f"{seed_desc}, {total_cells} total inference cells"
         )
 
-        # Load model ONCE for all dates and seeds
-        engine = HuggingFaceInference(model_path)
+        # Load model ONCE for all dates/seeds/past_days
+        engine = HuggingFaceInference(model_path, max_length=num_ctx)
         if not engine.load_model():
             print(f"ERROR: failed to load fine-tuned model from {model_path}")
             return
@@ -1492,44 +1565,47 @@ class MeteorologyFineTuner:
         model_name_for_file = self.model_name.split("/")[-1] + "-qlora"
 
         try:
-            for date, item in selected_items:
-                target_dir = (
-                    self.output_dir / _RESPONSES_SUBDIR / approach / date
-                    / f"{past_days}_past_days"
-                )
-                target_dir.mkdir(parents=True, exist_ok=True)
-
-                system_prompt = item["system_prompt"]
-                user_prompt = item["user_prompt"]
-
-                for seed in seed_list:
-                    response_data = engine.generate_response(
-                        system_prompt, user_prompt, seed=seed,
+            for pd_val in sweep_values:
+                selected_items = items_per_past_days[pd_val]
+                for date, item in selected_items:
+                    target_dir = (
+                        self.output_dir / _RESPONSES_SUBDIR / approach / date
+                        / f"{pd_val}_past_days"
                     )
-                    if response_data.get("error"):
-                        print(
-                            f"ERROR generating {date} seed={seed}: "
-                            f"{response_data['error']}"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+
+                    system_prompt = item["system_prompt"]
+                    user_prompt = item["user_prompt"]
+
+                    for seed in seed_list:
+                        response_data = engine.generate_response(
+                            system_prompt, user_prompt, seed=seed,
+                            num_predict=num_predict,
                         )
-                        continue
+                        if response_data.get("error"):
+                            print(
+                                f"ERROR generating {date} pd={pd_val} seed={seed}: "
+                                f"{response_data['error']}"
+                            )
+                            continue
 
-                    filename = self._save_response_json(
-                        target_dir=target_dir,
-                        model_name=model_name_for_file,
-                        approach=approach,
-                        date=date,
-                        past_days=past_days,
-                        seed=seed,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        response_data=response_data,
-                        include_seed_in_filename=include_seed_in_filename,
-                    )
-                    duration_s = response_data.get("total_duration", 0) / 1e9
-                    print(
-                        f"  {approach} {date} seed={seed}: "
-                        f"duration={duration_s:.1f}s, saved {filename}"
-                    )
+                        filename = self._save_response_json(
+                            target_dir=target_dir,
+                            model_name=model_name_for_file,
+                            approach=approach,
+                            date=date,
+                            past_days=pd_val,
+                            seed=seed,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            response_data=response_data,
+                            include_seed_in_filename=include_seed_in_filename,
+                        )
+                        duration_s = response_data.get("total_duration", 0) / 1e9
+                        print(
+                            f"  {approach} {date} pd={pd_val} seed={seed}: "
+                            f"duration={duration_s:.1f}s, saved {filename}"
+                        )
         finally:
             engine.unload_model()
 
@@ -1542,42 +1618,69 @@ class MeteorologyFineTuner:
         testing_data: List[Dict],
         past_days: int,
         zero_shot: bool,
+        past_days_values: Optional[List[int]] = None,
     ) -> None:
         """
-        Run create_analysis_tables_gpt for every test date.
+        Run statistical and judge analysis for every (date, past_days) cell.
 
-        Uses the new output_dir kwarg on create_analysis_tables_gpt to
-        write directly to fine_tuned_llm/results/{approach}/{date}/{N}_past_days/
-        instead of writing to the global results/ folder and copying via
-        shutil.copytree (which the previous pipeline did).
+        past_days_values: when None, evaluate only at the single `past_days`
+        value (backwards-compat). When given, sweep each value, matching
+        the list passed to _test_model_with_hf so every cell with saved
+        responses gets a matching analysis table.
         """
         approach = _approach_label(zero_shot)
         testing_dates = sorted(set(item["date"] for item in testing_data))
-        print(f"Evaluating {approach} performance across {len(testing_dates)} dates")
+        sweep_values = past_days_values if past_days_values else [past_days]
+        print(
+            f"Evaluating {approach} performance: {len(testing_dates)} dates "
+            f"x past_days {sweep_values}"
+        )
 
         for date in testing_dates:
-            try:
-                reference_text = load_reference_text(date)
-                responses_folder = (
-                    self.output_dir / _RESPONSES_SUBDIR / approach / date
-                    / f"{past_days}_past_days"
-                )
-                if not responses_folder.exists():
-                    print(f"WARNING: responses folder not found: {responses_folder}")
-                    continue
+            reference_text = load_reference_text(date)
+            for pd_val in sweep_values:
+                try:
+                    responses_folder = (
+                        self.output_dir / _RESPONSES_SUBDIR / approach / date
+                        / f"{pd_val}_past_days"
+                    )
+                    if not responses_folder.exists():
+                        print(f"WARNING: responses folder not found: {responses_folder}")
+                        continue
 
-                target_dir = (
-                    self.output_dir / _RESULTS_SUBDIR / approach / date
-                    / f"{past_days}_past_days"
-                )
-                create_analysis_tables_gpt(
-                    responses_folder=str(responses_folder),
-                    output_date=date,
-                    output_past_days=past_days,
-                    reference_text=reference_text,
-                    output_dir=str(target_dir),
-                )
-            except Exception as e:
-                print(f"ERROR analyzing {approach} date {date}: {e}")
+                    target_dir = (
+                        self.output_dir / _RESULTS_SUBDIR / approach / date
+                        / f"{pd_val}_past_days"
+                    )
+                    create_analysis_tables_gpt(
+                        responses_folder=str(responses_folder),
+                        output_date=date,
+                        output_past_days=pd_val,
+                        reference_text=reference_text,
+                        output_dir=str(target_dir),
+                    )
+
+                    # Judge analysis on the same responses folder. Output lands
+                    # inside fine_tuned_llm/ so it doesn't collide with the main
+                    # pipeline's llm_as_a_judge/ tree.
+                    judge_output_dir = (
+                        self.output_dir / _RESULTS_SUBDIR / approach / date
+                        / f"{pd_val}_past_days" / "judge"
+                    )
+                    try:
+                        create_judge_analysis(
+                            responses_folder=str(responses_folder),
+                            reference_text=reference_text,
+                            n_past_days=pd_val,
+                            date=date,
+                            output_dir=str(judge_output_dir),
+                        )
+                    except Exception as judge_err:
+                        print(
+                            f"WARNING: judge analysis failed for {approach} {date} "
+                            f"pd={pd_val}: {judge_err}"
+                        )
+                except Exception as e:
+                    print(f"ERROR analyzing {approach} {date} pd={pd_val}: {e}")
 
                 

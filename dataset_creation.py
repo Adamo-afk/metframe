@@ -1747,36 +1747,56 @@ def _generate_zero_shot_test_data(
     """
     Produce zero-shot test data. Does NOT call gpt-5-mini; uses a simple
     hand-crafted prompt with only weather data and historical context.
+
+    Sweeps past_days from 1 up to the given value, emitting one entry per
+    (date, past_days) combination. This lets the zero-shot eval be
+    compared against the few-shot and Ollama pipelines on the same
+    past_days x-axis rather than only at the largest value.
+
+    Note: increasing past_days here does NOT turn zero-shot into few-shot.
+    Only raw numerical context (additional days of weather readings) grows
+    with past_days; no reference diagnoses or worked examples are ever
+    added to the prompt. The count of task exemplars stays at zero at
+    every past_days value.
     """
     testing_dates = get_testing_dates(year)
-    print(f"Generating zero-shot test data for {len(testing_dates)} testing dates")
+    print(
+        f"Generating zero-shot test data for {len(testing_dates)} testing dates "
+        f"(past_days sweep 1..{past_days})"
+    )
 
     testing_data: List[Dict] = []
     for target_date in testing_dates:
         print(f"Processing {target_date}")
+        # Extract once at the largest window; per-past_days user prompts
+        # are derived by slicing this via extract_raw_csv_data_by_day.
         weather_data = _extract_weather_data(target_date, past_days)
         if weather_data is None:
             continue
-
-        daily_raw_data = extract_raw_csv_data_by_day(
-            weather_data, target_date, past_days, include_target_date=True,
-        )
-        user_prompt = _build_zero_shot_user_prompt(daily_raw_data, target_date)
 
         reference_diagnosis = ""
         if target_date in formatted_diagnoses:
             reference_diagnosis = _get_reference_diagnosis(formatted_diagnoses[target_date])
 
-        testing_data.append({
-            "date": target_date,
-            "past_days": past_days,
-            "approach": "zero-shot",
-            "system_prompt": _ZERO_SHOT_SYSTEM_PROMPT,
-            "user_prompt": user_prompt,
-            "reference_diagnosis": reference_diagnosis,
-        })
+        for current_past_days in range(1, past_days + 1):
+            daily_raw_data = extract_raw_csv_data_by_day(
+                weather_data, target_date, current_past_days, include_target_date=True,
+            )
+            user_prompt = _build_zero_shot_user_prompt(daily_raw_data, target_date)
 
-    print(f"Generated {len(testing_data)} zero-shot test examples")
+            testing_data.append({
+                "date": target_date,
+                "past_days": current_past_days,
+                "approach": "zero-shot",
+                "system_prompt": _ZERO_SHOT_SYSTEM_PROMPT,
+                "user_prompt": user_prompt,
+                "reference_diagnosis": reference_diagnosis,
+            })
+
+    print(
+        f"Generated {len(testing_data)} zero-shot test examples "
+        f"({len(testing_dates)} dates x {past_days} past_days values)"
+    )
     return testing_data
 
 

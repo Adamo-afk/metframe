@@ -1607,7 +1607,7 @@ STRUCTURA RĂSPUNSULUI:
 
 REGULI ABSOLUTE:
 - Răspunsul trebuie să fie CONCIS și DIRECT
-- NU include explicații pas cu pas în răspuns
+- Răspunde direct cu cele 5 propoziții structurate
 - NU repeta sau reformulezi datele din prompt
 - NU menționezi procesul de analiză
 - Folosește termeni meteorologici profesioniști

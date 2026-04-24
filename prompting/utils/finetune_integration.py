@@ -371,6 +371,8 @@ def run_finetuning_pipeline(args):
             skip_testing=args.skip_testing,
             zero_shot=zero_shot,
             n_seeds=getattr(args, "n_seeds", 1),
+            num_predict=getattr(args, "num_predict", 512),
+            num_ctx=getattr(args, "num_ctx", 16384),
         )
     except Exception as e:
         print(f"ERROR: pipeline failed: {e}")

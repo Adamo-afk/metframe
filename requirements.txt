@@ -1,27 +1,38 @@
 # Core ML / fine-tuning
 #
-# IMPORTANT: PyTorch must be installed with CUDA support. The default
-# 'pip install torch' installs CPU-only, which will fail for QLoRA
-# training, HF inference, and BERTScore (all run on GPU VRAM).
+# !!! ORDER MATTERS: install PyTorch with CUDA FIRST, then this file. !!!
 #
-# Install PyTorch with CUDA 12.6 FIRST, before installing the rest:
+# The default `pip install torch` (and any `pip install -r requirements.txt`
+# that lists torch without an explicit index URL) fetches the CPU-only
+# build. QLoRA training, HF inference, and BERTScore all allocate on GPU
+# VRAM and will fail at runtime with:
 #
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+#   ERROR: pipeline failed: CUDA is not available. QLoRA training
+#   requires a GPU. Verify torch.cuda.is_available() returns True.
 #
-# Then install the remaining dependencies:
+# Correct sequence (Windows / meteollm env):
 #
-#   pip install -r requirements.txt
+#   1) pip uninstall -y torch torchvision torchaudio
+#   2) pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+#   3) python -c "import torch; assert torch.cuda.is_available(), 'CPU torch still installed'"
+#   4) pip install -r requirements.txt
 #
-# The torch line below is commented out to prevent pip from overwriting
-# the CUDA build with a CPU-only build. If you already have CUDA torch
-# installed, pip will skip it when processing this file.
+# Step 3 is the preflight: if the assert fails, step 4 will waste time
+# installing dependencies around a torch that can't run the pipeline.
 #
-# torch>=2.1.0
-transformers>=4.40.0
-peft>=0.10.0
-datasets>=2.18.0
-trl>=0.8.0
-bitsandbytes>=0.43.0
+# torch is deliberately NOT listed as a package below, so this file never
+# triggers a silent CPU-only reinstall. If a CUDA build is already
+# present, pip leaves it alone.
+# Upper bounds deliberate: transformers 5.x removed TrainingArguments.group_by_length
+# and renamed Trainer(tokenizer=...) to Trainer(processing_class=...); trl 1.x moved
+# DataCollatorForCompletionOnlyLM out of the public API; peft 0.17+ refactored
+# prepare_model_for_kbit_training. Keep these ceilings until the training code is
+# migrated to the new majors.
+transformers>=4.40.0,<5.0
+peft>=0.10.0,<0.17
+datasets>=2.18.0,<4.0
+trl>=0.8.0,<0.17   # 0.17+ removed DataCollatorForCompletionOnlyLM entirely (not just from the public API); falling back to DataCollatorForLanguageModeling trains on prompt tokens, reintroducing the "memorize input format" bug
+bitsandbytes>=0.43.0,<0.50
 
 # Evaluation metrics
 rouge-score>=0.1.2

@@ -788,6 +788,7 @@ def create_judge_analysis(
     date: Optional[str] = None,
     system_prompt_path: Optional[str] = None,
     n_judge_runs_per_response: int = 1,
+    output_dir: Optional[str] = None,
 ) -> None:
     """
     Score every response JSON for past_days configurations 1..n_past_days
@@ -868,7 +869,10 @@ def create_judge_analysis(
         f"{total_judge_calls} total judge calls)"
     )
 
-    judge_output_dir = _JUDGE_OUTPUT_BASE / judge_model / date / f"{n_past_days}_past_days"
+    if output_dir is not None:
+        judge_output_dir = Path(output_dir)
+    else:
+        judge_output_dir = _JUDGE_OUTPUT_BASE / judge_model / date / f"{n_past_days}_past_days"
     judge_output_dir.mkdir(parents=True, exist_ok=True)
 
     client = OpenAI(api_key=_resolve_api_key(api_key))
