@@ -1780,8 +1780,24 @@ parser.add_argument(
     '--batch_size',
     '-bs',
     type=int,
-    default=24,
-    help='Batch size for training (default: 24)'
+    default=2,
+    help='Per-device training batch size for QLoRA fine-tuning. '
+         'On a 48GB RTX A6000 with max_seq_length=16384, batch sizes '
+         'above 2 OOM. Raise only if you also drop max_seq_length '
+         '(default: 2)'
+)
+parser.add_argument(
+    '--max_seq_length',
+    type=int,
+    default=16384,
+    help='Tokenizer truncation length for fine-tuning training and HF '
+         'inference. Must be >= the longest tokenized training example '
+         'or the response tail is silently dropped (the data collator '
+         'then masks labels to -100 and you see "This instance will be '
+         'ignored in loss calculation" warnings). 2024 dataset at '
+         'past_days=4 peaks at ~11.6K tokens; 16384 covers it with '
+         'headroom and matches the inference num_ctx default '
+         '(default: 16384)'
 )
 parser.add_argument(
     '--zero_shot',

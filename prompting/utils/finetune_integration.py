@@ -354,6 +354,7 @@ def run_finetuning_pipeline(args):
 
     fine_tuner = MeteorologyFineTuner(
         output_dir="fine_tuned_llm",
+        max_length=getattr(args, "max_seq_length", 16384),
         training_seed=getattr(args, "training_seed", 42),
         use_completion_only_collator=not getattr(args, "legacy_collator", False),
     )
@@ -413,6 +414,7 @@ def run_comparison_pipeline(args):
 
     fine_tuner = MeteorologyFineTuner(
         output_dir="fine_tuned_llm",
+        max_length=getattr(args, "max_seq_length", 16384),
         training_seed=getattr(args, "training_seed", 42),
         use_completion_only_collator=not getattr(args, "legacy_collator", False),
     )

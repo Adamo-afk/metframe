@@ -21,6 +21,7 @@ formatted_diagnoses_*/
 plots/
 plots_llm_as_a_judge/
 fine_tuned_llm/
+baselines/
 
 # Summary files
 *_summary.json

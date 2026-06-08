@@ -566,7 +566,7 @@ Analizează mai întâi textul de referință și identifică următoarele eleme
 
 1. Observații generale despre vremea din ziua curentă comparativ cu zilele precedente, pe baza temperaturilor și prognozelor anterioare.
 
-2. Descrierea stării cerului (pe baza valorii Nop: 1=senin, 8=acoperit) și a vântului (pe baza valorii Rff1: sub 3 m/s=slab, peste 6 m/s=puternic).
+2. Descrierea stării cerului (pe baza valorii Nop, scara WMO 2700 în octanți: 0=cer complet senin, 8=cer complet acoperit; 9=cer neobservabil) și a vântului (pe baza valorii Rff1: sub 3 m/s=slab, peste 6 m/s=puternic).
 
 3. Această propoziție există DOAR DACĂ sunt menționate fenomene meteorologice repetate în ultimele 24 ore (ploi, ninsori, ceață, etc.). Dacă nu există fenomene repetate, această propoziție lipsește.
 

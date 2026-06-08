@@ -73,23 +73,16 @@ def get_training_date_ranges(year: int) -> List[str]:
 # Model and training configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BATCH_SIZE = 2
-
-# Tokenizer truncation length used during training. Must be >= the longest
-# tokenized training example, otherwise the tail (task block + target
-# response) is silently dropped and the model trains on headers-plus-CoT
-# only. Measured distribution on the 2024 dataset at past_days=4: p50=9.4K,
-# p99=11K, max=11.6K tokens. 16384 covers the max with headroom and matches
-# the num_ctx ceiling used at inference so training and eval see prompts
-# in the same format.
-_MAX_SEQUENCE_LENGTH = 16384
-
 # LoRA configuration for the 8B base model.
 # target_modules covers all attention projections and MLP sublayers,
 # which is the standard "full-coverage" LoRA setup.
+#
+# base_model and max_length are intentionally not stored here. base_model
+# is fixed by the MeteorologyFineTuner constructor default; max_length
+# is a constructor argument that callers must supply (see
+# finetune_integration.run_finetuning_pipeline) - the prior MODEL_CONFIG
+# entries for both were dead, never consulted by the pipeline.
 MODEL_CONFIG: Dict = {
-    "base_model": "meta-llama/Llama-3.1-8B-Instruct",
-    "max_length": _MAX_SEQUENCE_LENGTH,
     "lora_r": 32,
     "lora_alpha": 64,
     "lora_dropout": 0.1,
@@ -122,18 +115,22 @@ MODEL_CONFIG: Dict = {
 #     get ~36 steps/epoch, so the LR schedule has runway to actually
 #     move LoRA weights. VRAM headroom at seq=16384 is fine thanks to
 #     gradient checkpointing (enabled by prepare_model_for_kbit_training).
-#   - save_steps / eval_steps 200 -> 40. At the previous value, neither
-#     fired before end-of-training. 40 gives ~3 intermediate checkpoints
-#     across the run.
+#   - save_steps 200 -> 40. At the previous value it never fired before
+#     end-of-training. 40 gives ~3 intermediate checkpoints across the run.
+#
+# Keys intentionally not stored here:
+#   - per_device_train_batch_size: always supplied by the CLI --batch_size
+#     flag (see main.py / finetune_integration.run_finetuning_pipeline);
+#     a default here would be silently overridden on every run.
+#   - eval_steps: no eval_dataset is passed to the Trainer, so eval never
+#     runs. Adding an eval_steps value here had no effect.
 TRAINING_CONFIG: Dict = {
     "num_train_epochs": 3,
     "learning_rate": 2e-4,
     "warmup_ratio": 0.05,
-    "per_device_train_batch_size": _DEFAULT_BATCH_SIZE,
     "gradient_accumulation_steps": 1,
     "logging_steps": 10,
     "save_steps": 40,
-    "eval_steps": 40,
     "save_total_limit": 3,
 }
 

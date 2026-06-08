@@ -90,7 +90,7 @@
 
 #     1. PRIMA PROPOZIȚIE: Observații generale despre vremea din ziua curentă comparativ cu zilele precedente, pe baza temperaturilor maxime și minime înregistrate.
 
-#     2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 1-8, unde 1 = cer senin, 8 = complet acoperit) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
+#     2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 0 și 8 în octanți, unde 0 = cer complet senin, 8 = cer complet acoperit; valoarea 9 marchează cerul neobservabil, e.g. din cauza ceții sau a precipitațiilor) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
 
 #     3. A TREIA PROPOZIȚIE (OPȚIONALĂ): Această propoziție se include DOAR DACĂ un fenomen meteorologic specific s-a repetat în ultimele 24 de ore (de exemplu: ploi, ninsori, ceață, etc.). Dacă nu există fenomene repetate, se omite această propoziție.
 
@@ -901,7 +901,7 @@
 
 # 1. PRIMA PROPOZIȚIE: Observații generale despre vremea din ziua curentă comparativ cu zilele precedente, pe baza temperaturilor maxime și minime înregistrate și a informațiilor din prognozele anterioare.
 
-# 2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 1-8, unde 1 = cer senin, 8 = complet acoperit) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
+# 2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 0 și 8 în octanți, unde 0 = cer complet senin, 8 = cer complet acoperit; valoarea 9 marchează cerul neobservabil, e.g. din cauza ceții sau a precipitațiilor) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
 
 # 3. A TREIA PROPOZIȚIE (OPȚIONALĂ): Această propoziție se include DOAR DACĂ un fenomen meteorologic specific s-a repetat în ultimele 24 de ore (de exemplu: ploi, ninsori, ceață, etc.). Dacă nu există fenomene repetate, se omite această propoziție.
 
@@ -1351,7 +1351,7 @@ STRUCTURA RĂSPUNSULUI:
 
 1. PRIMA PROPOZIȚIE: Observații generale despre vremea din ziua curentă comparativ cu zilele precedente, pe baza temperaturilor maxime și minime înregistrate și a informațiilor din prognozele anterioare.
 
-2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 1-8, unde 1 = cer senin, 8 = complet acoperit) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
+2. A DOUA PROPOZIȚIE: Descrierea stării cerului (senin sau acoperit de nori, pe baza valorii Nop care variază între 0 și 8 în octanți, unde 0 = cer complet senin, 8 = cer complet acoperit; valoarea 9 marchează cerul neobservabil, e.g. din cauza ceții sau a precipitațiilor) și a vântului (slab sau puternic, pe baza valorii Rff1 în m/s, unde sub 3 m/s = slab, peste 6 m/s = puternic).
 
 3. A TREIA PROPOZIȚIE (OPȚIONALĂ): Această propoziție se include DOAR DACĂ un fenomen meteorologic specific s-a repetat în ultimele 24 de ore (de exemplu: ploi, ninsori, ceață, etc.). Dacă nu există fenomene repetate, se omite această propoziție.
 
