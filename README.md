@@ -927,7 +927,7 @@ The system prompt is explicit:
 
 ```
 Output a Romanian paragraph covering every main region listed below.
-For each region (or subdivision) emit a sentence with a temperature
+For each region (or subdivision) emit a sentence with a TEMPERATURE
 range of the form [x, y] where x and y are the boundaries of a
 2 degC bin (i.e. y - x = 2 and x is even).
 
@@ -938,6 +938,18 @@ Examples:
 Do NOT use fluent Romanian here for the interval - the post-processor
 will reword [x, y] into "intre x si y degC" automatically.
 ```
+
+**Output is ALWAYS temperature, never aux variables.** The system
+prompt has a dedicated CONSTRANGERE FUNDAMENTALA section that forbids
+emitting `[x, y]` intervals for precipitation (mm), wind (m/s) or
+nebulosity (octa) even in `historic_plus_aux` and `aux_only` modes
+where the user prompt contains those numbers as input context. Every
+`[x, y]` the model emits is implicitly in °C; the unit `°C` may
+appear *after* the brackets but no other unit ever may. This is
+critical because the regex parser is unit-agnostic — without the
+constraint, a `[5, 15] mm` for rain would be ingested as a 5–15 °C
+temperature interval and `manual_score` would produce nonsense
+distances against the GT.
 
 The post-processor consumes the brackets in two passes:
 
