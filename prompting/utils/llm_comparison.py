@@ -497,12 +497,53 @@ def dedupe_zones(zones: Sequence[Dict]) -> List[Dict]:
 
 # Regex for the strict bracketed temperature range the system prompt
 # will mandate. Accepts optional whitespace and integer or one-decimal
-# values, optionally followed by a "°C" / "C" unit which we discard.
+# values (one decimal is tolerated even though the system prompt asks
+# for integers, so we can still recover and snap rather than drop the
+# prediction outright), optionally followed by a "°C" / "C" unit which
+# we discard.
 _INTERVAL_RE = re.compile(
     r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
     r"(?:\s*\xb0?\s*C)?",
     flags=re.IGNORECASE,
 )
+
+
+_BIN_WIDTH_C: float = 2.0
+
+
+def _snap_to_2c_bin(
+    x_raw: float, y_raw: float, bin_width: float = _BIN_WIDTH_C,
+) -> Tuple[int, int, bool]:
+    """
+    Project a possibly-non-compliant raw interval [x_raw, y_raw] onto
+    the standard 2 degC ANM bin grid (..., -4, -2, 0, 2, 4, ...). The
+    system prompt mandates integer-anchored bins, but models occasionally
+    emit floats, off-grid integers, or off-width pairs - rather than
+    drop the prediction we snap by midpoint:
+
+        m         = (x_raw + y_raw) / 2
+        bin_start = bin_width * floor(m / bin_width)
+        bin_end   = bin_start + bin_width
+
+    Returns (x_snapped, y_snapped, was_snapped) where was_snapped is
+    True iff (x_raw, y_raw) didn't already sit on the grid (within a
+    1e-9 tolerance for round-trip float artefacts). The runner uses
+    that flag to count non-compliant rows.
+
+    Examples:
+        (0, 2)        -> (0, 2, False)              already on grid
+        (10.5, 12.5)  -> (10, 12, True)             snapped down
+        (1, 3)        -> (2, 4, True)               m=2 lands on the [2, 4] bin
+        (10, 13)      -> (10, 12, True)             width corrected from 3 to 2
+        (-4.1, -2.1)  -> (-6, -4, True)             snapped down across zero
+    """
+    m = (x_raw + y_raw) / 2.0
+    bin_start = bin_width * math.floor(m / bin_width)
+    bin_end = bin_start + bin_width
+    was_snapped = (
+        abs(bin_start - x_raw) > 1e-9 or abs(bin_end - y_raw) > 1e-9
+    )
+    return int(bin_start), int(bin_end), was_snapped
 
 
 def extract_predictions_from_paragraph(
@@ -552,10 +593,15 @@ def extract_predictions_from_paragraph(
         sent_end = sent_start + len(sent)
         cursor = sent_end
 
-        intervals = [
-            (m.start(), m.end(), float(m.group(1)), float(m.group(2)))
-            for m in _INTERVAL_RE.finditer(sent)
-        ]
+        intervals = []
+        for m in _INTERVAL_RE.finditer(sent):
+            x_raw, y_raw = float(m.group(1)), float(m.group(2))
+            x_snap, y_snap, was_snapped = _snap_to_2c_bin(x_raw, y_raw)
+            intervals.append((
+                m.start(), m.end(),
+                x_snap, y_snap,
+                x_raw, y_raw, was_snapped,
+            ))
         if not intervals:
             continue
 
@@ -571,14 +617,14 @@ def extract_predictions_from_paragraph(
             # Find the closest interval midpoint.
             best = None
             best_d = None
-            for i_start, i_end, x, y in intervals:
+            for i_start, i_end, x, y, x_raw, y_raw, was_snapped in intervals:
                 # Distance from zone span to interval span (zero if they overlap).
                 mid_iv = (i_start + i_end) / 2.0
                 d = abs(zs - mid_iv)
                 if best_d is None or d < best_d:
                     best_d = d
-                    best = (x, y)
-            x, y = best
+                    best = (x, y, x_raw, y_raw, was_snapped)
+            x, y, x_raw, y_raw, was_snapped = best
             out.append({
                 "raw_phrase": z["raw_phrase"],
                 "axis": z["axis"],
@@ -587,6 +633,8 @@ def extract_predictions_from_paragraph(
                 "cardinal": z["cardinal"],
                 "stations": list(z["stations"]),
                 "interval": [x, y],
+                "interval_raw": [x_raw, y_raw],
+                "snapped_to_2c_grid": was_snapped,
                 "midpoint": (x + y) / 2.0,
                 "sentence": sent.strip(),
             })
@@ -804,11 +852,29 @@ valorile din paragraful tau):
 
        [x, y]
 
-   unde x si y sunt valori numerice in grade Celsius, iar diferenta
-   y - x trebuie sa fie de EXACT 2 grade (binul standard ANM de 2 °C).
-   De exemplu: [0, 2], [-4, -2], [10, 12]. Nu folosi alte formate (nu
-   folosi "intre x si y", nu folosi "x..y", nu folosi paranteze
-   rotunde sau acolade).
+   unde:
+     - x si y sunt NUMERE INTREGI (nu folosi zecimale - NU emite
+       valori ca [1.5, 3.5] sau [10.0, 12.0]; foloseste DOAR [1, 3]
+       sau [10, 12]),
+     - x trebuie sa fie un numar par (..., -4, -2, 0, 2, 4, 6, 8, 10,
+       12, 14, 16, 18, 20, 22, 24, ...) - intervalele sunt ancorate
+       pe grila standard ANM de 2 °C,
+     - diferenta y - x trebuie sa fie EXACT 2 (binul standard ANM
+       de 2 °C, deci y = x + 2).
+
+   Exemple corecte: [0, 2], [-4, -2], [10, 12], [-20, -18], [22, 24].
+   Exemple INCORECTE de format de interval:
+     [1, 3]      <- INCORECT (x=1 este impar; foloseste [0, 2] sau [2, 4])
+     [10.5, 12.5]<- INCORECT (foloseste numere intregi: [10, 12] sau [12, 14])
+     [10, 13]    <- INCORECT (y - x = 3, nu 2; foloseste [10, 12])
+     "intre 10 si 12"  <- INCORECT (nu folosi text in loc de paranteze)
+     (10, 12)    <- INCORECT (nu folosi paranteze rotunde)
+     {10, 12}    <- INCORECT (nu folosi acolade)
+
+   Daca estimezi de exemplu o medie de 11.3 °C pentru o zona, alege
+   cel mai apropiat bin de 2 °C: 11.3 cade in [10, 12], deci emite
+   [10, 12]. Un post-procesor automat va ajusta valorile non-conforme
+   pe grila de 2 °C, dar incearca sa respecti formatul de la inceput.
 
 3. Fiecare propozitie trebuie sa contina cel putin o referire la o
    zona si cel putin un interval [x, y] de TEMPERATURA. Daca o
@@ -1260,13 +1326,13 @@ _FLUENT_REWRITE_RE = re.compile(
 
 
 def _format_brackets_replacement(match: "re.Match") -> str:
-    x = float(match.group(1))
-    y = float(match.group(2))
-
-    def _fmt(v: float) -> str:
-        return f"{v:.0f}" if float(v).is_integer() else f"{v:g}"
-
-    return f"intre {_fmt(x)} si {_fmt(y)} °C"
+    x_raw = float(match.group(1))
+    y_raw = float(match.group(2))
+    # Snap to the standard 2 degC ANM grid so the fluent text matches
+    # what manual_score actually consumed. extract_predictions_from_paragraph
+    # also snaps, so this keeps the two views consistent.
+    x, y, _ = _snap_to_2c_bin(x_raw, y_raw)
+    return f"intre {x} si {y} °C"
 
 
 def postprocess_brackets_to_fluent_romanian(text: str) -> str:
@@ -1476,6 +1542,10 @@ def manual_score(
     accuracy = 1.0 / (1.0 + d_bar / bin_width)
     error_pct = 1.0 - accuracy
 
+    n_intervals_total = len(pred_records)
+    n_snapped = sum(
+        1 for r in pred_records if r.get("snapped_to_2c_grid", False)
+    )
     return {
         "accuracy": accuracy,
         "error_pct": error_pct,
@@ -1486,6 +1556,14 @@ def manual_score(
             "missed": n_missed,
             "false_pos": n_false_pos,
             "unscorable": n_unscorable,
+        },
+        "format_compliance": {
+            "n_intervals_total": n_intervals_total,
+            "n_snapped_to_2c_grid": n_snapped,
+            "compliance_ratio": (
+                1.0 - n_snapped / n_intervals_total
+                if n_intervals_total > 0 else None
+            ),
         },
         "per_station": per_station,
         "pred_records": [
@@ -2086,9 +2164,15 @@ def run_llm_tests(
                         log_path, done, total, scenario, fold_n, mode,
                         target_month, pred_flags, judge_flags,
                     )
+                    fc = manual["format_compliance"]
+                    snap_note = (
+                        f"  snapped={fc['n_snapped_to_2c_grid']}/{fc['n_intervals_total']}"
+                        if fc["n_snapped_to_2c_grid"] else ""
+                    )
                     print(f"    manual accuracy={manual['accuracy']:.3f}  "
                           f"judge accuracy="
-                          f"{('%.3f' % judge['judge_accuracy']) if judge['judge_accuracy'] is not None else 'None'}")
+                          f"{('%.3f' % judge['judge_accuracy']) if judge['judge_accuracy'] is not None else 'None'}"
+                          f"{snap_note}")
                     if _flag_is_problem(pred_flags) or _flag_is_problem(judge_flags):
                         print(f"    WARNING: token-limit event logged to {log_path}")
                     rec = {
@@ -2112,6 +2196,7 @@ def run_llm_tests(
                             "d_bar": manual["d_bar"],
                             "w": manual["w"],
                             "counts": manual["counts"],
+                            "format_compliance": manual["format_compliance"],
                         },
                         "judge_score": judge,
                         "input_prompt_chars": len(usr_p) + len(sys_p),
@@ -2475,6 +2560,7 @@ def run_baseline_to_llm_format(
                         "d_bar": manual["d_bar"],
                         "w": manual["w"],
                         "counts": manual["counts"],
+                        "format_compliance": manual["format_compliance"],
                     },
                     "judge_score": judge,
                     "input_prompt_chars": 0,

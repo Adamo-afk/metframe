@@ -951,6 +951,48 @@ constraint, a `[5, 15] mm` for rain would be ingested as a 5–15 °C
 temperature interval and `manual_score` would produce nonsense
 distances against the GT.
 
+**Integer-anchored 2 °C grid + automatic snapping.** Format rule 2
+of the system prompt also requires `x` and `y` to be integers, `x`
+even, and `y = x + 2` — i.e. intervals must sit on the standard ANM
+grid `..., [-4, -2], [-2, 0], [0, 2], [2, 4], ...`. Some models will
+nonetheless emit floats, odd-anchored integers, or off-width pairs.
+Rather than drop those predictions, the parser snaps them by
+midpoint via `_snap_to_2c_bin` (in `prompting/utils/llm_comparison.py`):
+
+```
+m         = (x_raw + y_raw) / 2
+bin_start = 2 * floor(m / 2)
+[x_snap, y_snap] = [bin_start, bin_start + 2]
+```
+
+Examples:
+
+| Raw bracket | Snapped | Reason |
+|---|---|---|
+| `[0, 2]` | `[0, 2]` | already on the grid |
+| `[10.5, 12.5]` | `[10, 12]` | floats → snap down |
+| `[1, 3]` | `[2, 4]` | odd anchor → snap up |
+| `[10, 13]` | `[10, 12]` | width = 3 → corrected to 2 |
+| `[-4.1, -2.1]` | `[-4, -2]` | floats across zero |
+
+Both `manual_score` and the fluent post-processor use the snapped
+form, so the human-readable text and the scored intervals stay
+consistent. Each per-eval JSON record carries a
+`manual_score.format_compliance` block:
+
+```
+format_compliance:
+    n_intervals_total      total [x, y] brackets extracted
+    n_snapped_to_2c_grid   how many needed snapping
+    compliance_ratio       1 - snapped/total   (1.0 = fully compliant)
+```
+
+A `snapped=N/M` note also appears next to the accuracy line in the
+runner's console output when `N > 0`, so format violations are
+visible during the run. Per-record `interval_raw` is kept alongside
+the snapped `interval` for after-the-fact auditing of which models
+need the strictest prompt enforcement.
+
 The post-processor consumes the brackets in two passes:
 
 1. **Parse** each `[a, b]` (rounding to integers; tolerating `oC`,
