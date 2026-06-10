@@ -871,6 +871,7 @@ produces a single comparison plot that includes both families.
 |---|---|---|
 | `run` | Runs the (5 input modes × 7 folds) test matrix for **one** Ollama LLM and writes a per-model JSON for the plotter | `llm_runs/llm_runs_<model>.json` plus, if any prompt truncates or any output is cut off, an append-only line in `llm_runs/logs/token_limits_<model>.log` |
 | `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known April days, synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
+| `postprocess` | Re-applies the fluent-Romanian rewriter over every `llm_runs_*.json` without rerunning any LLM. Useful for iterating on the rewriter (quantifier handling, snapping, unit formats) once raw paragraphs are already on disk | Updates `predicted_paragraph_fluent` in place; optionally writes `.json.bak` backups |
 | `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary and two figure families — per-scenario accuracy curves vs fold size, and manual-vs-judge agreement scatter per model | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png` |
 
 ```
@@ -992,6 +993,61 @@ runner's console output when `N > 0`, so format violations are
 visible during the run. Per-record `interval_raw` is kept alongside
 the snapped `interval` for after-the-fact auditing of which models
 need the strictest prompt enforcement.
+
+### Fluent post-processing — quantifier-aware, paragraph-aware
+
+Manual scoring consumes the raw brackets; humans (and the judge
+in some debug workflows) read the **fluent** paragraph. The
+rewriter turns `[a, b]` and the optional Romanian quantifier word
+in front of it into grammatical prose, snapping the bracket onto
+the 2 °C grid in the same pass. Quantifier handling is paragraph-
+aware so a directional word only collapses to a single value when
+the bracket actually sits at the corresponding extreme of the
+paragraph:
+
+| Quantifier | Collapses to | Only if |
+|---|---|---|
+| `sub` / `de la` | `sub a` / `de la a` | the bracket has the LOWEST `a` of any bracket in the paragraph |
+| `peste` / `până la` | `peste b` / `până la b` | the bracket has the HIGHEST `b` of any bracket in the paragraph |
+| `intre` (default) | `intre a si b` | always |
+| anything else at a non-extreme bracket | `intre a si b` | quantifier word is silently DROPPED |
+
+Examples (the last one shows the drop behaviour — `sub` on the
+upper bin and `peste` on the lower bin are physically nonsensical,
+so both quantifiers vanish):
+
+```
+IN:  pe crestele montane inregistrandu-se valori sub [0, 2] °C
+OUT: pe crestele montane inregistrandu-se valori sub 0 °C
+
+IN:  In Muntenia mediile au fost intre [10, 12] °C, iar pe creste sub [-8, -6] °C
+OUT: In Muntenia mediile au fost intre 10 si 12 °C, iar pe creste sub -8 °C
+
+IN:  Pe litoral peste [16, 18] °C, in Maramures sub [4, 6] °C, in Muntenia intre [12, 14] °C
+OUT: Pe litoral peste 18 °C, in Maramures sub 4 °C, in Muntenia intre 12 si 14 °C
+
+IN:  sub [10, 12] si peste [4, 6]
+OUT: intre 10 si 12 °C si intre 4 si 6 °C
+```
+
+Diacritic variants (`pana` / `pâna` / `pană` / `până`, `intre` /
+`între` / `într?e`) and unit forms (`°C`, `oC`, `degC`, `C`) are
+all accepted on the input side.
+
+**Re-running fluent processing on already-finished runs** is what
+the `postprocess` CLI subcommand is for — no LLM inference is
+re-issued. The rewriter is fast (pure regex over a few thousand
+records); iterating on its rules takes a fraction of a second over
+a complete `llm_runs/` directory.
+
+```
+python -m prompting.utils.llm_comparison postprocess [--llm_runs_dir llm_runs] [--backup]
+```
+
+`--backup` writes a `.json.bak` copy of every file before
+overwriting, so a problematic rewriter change can be rolled back
+without losing the raw LLM outputs. Without it, rewriter changes
+are applied in place.
 
 The post-processor consumes the brackets in two passes:
 

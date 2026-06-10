@@ -1287,41 +1287,147 @@ def build_prompt_pair(
 # Post-processing [x, y] -> fluent Romanian
 # ---------------------------------------------------------------------------
 
-# The fluent-Romanian rewriter consumes (optionally) the preceding
-# 'intre' / 'între' word AND the bracket AND any trailing unit, so a
-# model output like 'cuprinse intre [0, 2] °C' doesn't become
-# 'cuprinse intre intre 0 si 2 °C'. Unit forms covered: '°C', 'oC',
-# 'C', 'degC'. The whole construct is replaced with a single fluent
-# 'intre X si Y °C'.
+# The fluent-Romanian rewriter consumes (optionally) a Romanian
+# quantifier word in front of the bracket ('sub', 'peste', 'pana la',
+# 'de la', 'intre' / 'într?e' / 'între'), the bracket itself, and
+# any trailing unit. Without quantifier handling, "valori sub
+# [0, 2] °C" would become the broken "valori sub intre 0 si 2 °C".
+# Diacritic variants (pana / pâna / pană / până, intre / între /
+# într?e) are all accepted; unit forms covered are '°C', 'oC', 'C',
+# 'degC'.
+#
+# Collapse rules are PARAGRAPH-AWARE:
+#   'sub' / 'de la'       collapse to single value only when the
+#                         bracket is the LOWEST in the paragraph
+#   'peste' / 'pana la'   collapse only when the bracket is the
+#                         HIGHEST in the paragraph
+# Any other quantifier+bracket combination drops the quantifier
+# word and falls back to 'intre x si y'. This matches the model's
+# intent (the value sits inside the bin) without leaving broken
+# Romanian when a directional word lands on a middle bin.
+
+_QUANTIFIER_PATTERN = (
+    r"(?:p[aâ]n[aă]\s+la|p[aâ]n[aă]|sub|peste|de\s+la|intre|într?e)"
+)
+
 _FLUENT_REWRITE_RE = re.compile(
-    r"(?:\b(?:intre|într?e)\s+)?"                       # optional 'intre' word
+    rf"(?:\b({_QUANTIFIER_PATTERN})\s+)?"                # optional quantifier
     r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
     r"(?:\s*(?:\xb0\s*[Cc]|deg\s*[Cc]|[Cc]))?",          # optional unit
     flags=re.IGNORECASE,
 )
 
 
-def _format_brackets_replacement(match: "re.Match") -> str:
-    x_raw = float(match.group(1))
-    y_raw = float(match.group(2))
-    # Snap to the standard 2 degC ANM grid so the fluent text matches
-    # what manual_score actually consumed. extract_predictions_from_paragraph
-    # also snaps, so this keeps the two views consistent.
-    x, y, _ = _snap_to_2c_bin(x_raw, y_raw)
-    return f"intre {x} si {y} °C"
+def _normalize_quantifier(raw: str) -> str:
+    """Lower-case + diacritic-strip + collapse whitespace so every
+    Romanian variant maps to a small set of canonical keys."""
+    if not raw:
+        return ""
+    return re.sub(r"\s+", " ", _strip_diacritics(raw.lower())).strip()
 
 
 def postprocess_brackets_to_fluent_romanian(text: str) -> str:
     """
-    Rewrite every '[x, y]' (optionally preceded by 'intre' / 'între'
-    and optionally followed by '°C' / 'degC' / 'C') as a fluent Romanian
-    'intre x si y °C'. Leaves the rest of the paragraph untouched.
+    Rewrite every '[x, y]' (optionally preceded by a Romanian
+    quantifier - 'sub', 'peste', 'pana la', 'de la', 'intre' - and
+    optionally followed by '°C' / 'degC' / 'C') into grammatical
+    fluent Romanian.
 
-    The structured form should be kept alongside the post-processed
-    form when persisting LLM outputs - the scorer needs the raw
-    brackets, the reader wants the fluent text.
+    Quantifier-aware AND paragraph-aware: 'sub' / 'de la' collapse
+    to a single value only when the bracket is the LOWEST in the
+    paragraph; 'peste' / 'pana la' collapse only when the bracket
+    is the HIGHEST. Any other quantifier+bracket combination drops
+    the quantifier word and falls back to 'intre x si y'.
+
+    The bracket values are also snapped to the standard 2 degC ANM
+    grid via _snap_to_2c_bin so the fluent text matches what
+    manual_score consumed.
+
+    This function can be re-run over already-finished llm_runs JSON
+    files via the `postprocess` CLI subcommand without rerunning
+    any LLM inference - useful for iterating on the rewriter without
+    burning compute.
     """
-    return _FLUENT_REWRITE_RE.sub(_format_brackets_replacement, text)
+    # First pass: collect all snapped (x, y) pairs in the paragraph
+    # to determine min(x) and max(y). Quantifier collapse depends on
+    # whether the current bracket sits at one of those extremes.
+    pairs: List[Tuple[int, int]] = []
+    for m in _FLUENT_REWRITE_RE.finditer(text):
+        x, y, _ = _snap_to_2c_bin(float(m.group(2)), float(m.group(3)))
+        pairs.append((x, y))
+    if not pairs:
+        return text
+    min_x = min(p[0] for p in pairs)
+    max_y = max(p[1] for p in pairs)
+
+    def _format(match: "re.Match") -> str:
+        q = _normalize_quantifier(match.group(1) or "")
+        x_raw, y_raw = float(match.group(2)), float(match.group(3))
+        x, y, _ = _snap_to_2c_bin(x_raw, y_raw)
+
+        if q == "sub" and x == min_x:
+            return f"sub {x} °C"
+        if q == "de la" and x == min_x:
+            return f"de la {x} °C"
+        if q == "peste" and y == max_y:
+            return f"peste {y} °C"
+        if q in ("pana", "pana la") and y == max_y:
+            return f"pana la {y} °C"
+
+        return f"intre {x} si {y} °C"
+
+    return _FLUENT_REWRITE_RE.sub(_format, text)
+
+
+def refresh_fluent_paragraphs(
+    llm_runs_dir: str | Path = "llm_runs",
+    backup: bool = False,
+) -> Dict[str, int]:
+    """
+    Re-apply `postprocess_brackets_to_fluent_romanian` over every
+    record in every llm_runs_*.json under `llm_runs_dir`, updating
+    `predicted_paragraph_fluent` in place. Records without a
+    `predicted_paragraph_raw` (e.g. rows that errored out during
+    the LLM call) are skipped without touching them.
+
+    Args:
+        llm_runs_dir: directory containing llm_runs_<model>.json
+        backup: if True, write each file's previous contents to
+            <name>.json.bak before overwriting.
+
+    Returns: { json_filename: n_rows_with_changed_fluent_string }
+    """
+    out_dir = Path(llm_runs_dir)
+    if not out_dir.is_dir():
+        raise FileNotFoundError(f"llm_runs directory not found: {out_dir}")
+
+    summary: Dict[str, int] = {}
+    for path in sorted(out_dir.glob("llm_runs_*.json")):
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        results = blob.get("results", [])
+        n_seen = 0
+        n_changed = 0
+        for r in results:
+            raw = r.get("predicted_paragraph_raw")
+            if not raw:
+                continue
+            new_fluent = postprocess_brackets_to_fluent_romanian(raw)
+            if new_fluent != r.get("predicted_paragraph_fluent"):
+                n_changed += 1
+            r["predicted_paragraph_fluent"] = new_fluent
+            n_seen += 1
+        if backup:
+            path.with_suffix(".json.bak").write_text(
+                json.dumps(blob, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False, indent=2)
+        summary[path.name] = n_changed
+        print(f"  {path.name}: refreshed {n_seen} rows "
+              f"({n_changed} fluent strings changed)")
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -2957,7 +3063,31 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
     baseline_eval.add_argument("--device", type=str, default="auto",
                                choices=["auto", "cpu", "cuda"])
 
+    postprocess = subs.add_parser(
+        "postprocess",
+        help="Re-apply the fluent-Romanian rewriter over every "
+             "llm_runs_*.json under --llm_runs_dir without rerunning "
+             "any LLM. Useful for iterating on the rewriter (quantifier "
+             "handling, snapping, unit formats) once raw paragraphs "
+             "have already been generated.",
+    )
+    postprocess.add_argument("--llm_runs_dir", type=str, default="llm_runs",
+                             help="Directory containing llm_runs_<model>.json.")
+    postprocess.add_argument("--backup", action="store_true",
+                             help="Write a .json.bak copy of each file "
+                                  "before overwriting.")
+
     args = p.parse_args(argv)
+
+    if args.subcommand == "postprocess":
+        print(f"Re-running fluent post-processing over {args.llm_runs_dir}/")
+        summary = refresh_fluent_paragraphs(
+            llm_runs_dir=args.llm_runs_dir, backup=args.backup,
+        )
+        total_changed = sum(summary.values())
+        print(f"Done. {total_changed} fluent strings changed across "
+              f"{len(summary)} files.")
+        return 0
 
     if args.subcommand == "baseline_eval":
         metadata = load_stations_metadata(
