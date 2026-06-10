@@ -862,20 +862,6 @@ valorile din paragraful tau):
      - diferenta y - x trebuie sa fie EXACT 2 (binul standard ANM
        de 2 °C, deci y = x + 2).
 
-   Exemple corecte: [0, 2], [-4, -2], [10, 12], [-20, -18], [22, 24].
-   Exemple INCORECTE de format de interval:
-     [1, 3]      <- INCORECT (x=1 este impar; foloseste [0, 2] sau [2, 4])
-     [10.5, 12.5]<- INCORECT (foloseste numere intregi: [10, 12] sau [12, 14])
-     [10, 13]    <- INCORECT (y - x = 3, nu 2; foloseste [10, 12])
-     "intre 10 si 12"  <- INCORECT (nu folosi text in loc de paranteze)
-     (10, 12)    <- INCORECT (nu folosi paranteze rotunde)
-     {10, 12}    <- INCORECT (nu folosi acolade)
-
-   Daca estimezi de exemplu o medie de 11.3 °C pentru o zona, alege
-   cel mai apropiat bin de 2 °C: 11.3 cade in [10, 12], deci emite
-   [10, 12]. Un post-procesor automat va ajusta valorile non-conforme
-   pe grila de 2 °C, dar incearca sa respecti formatul de la inceput.
-
 3. Fiecare propozitie trebuie sa contina cel putin o referire la o
    zona si cel putin un interval [x, y] de TEMPERATURA. Daca o
    propozitie mentioneaza mai multe zone, intervalul se aplica
@@ -907,16 +893,6 @@ Exemple corecte de fragmente (toate intervalele sunt in °C):
   "In zona montana inalta temperatura medie lunara a fost cuprinsa
    intre [-8, -6] °C, iar pe creste, la peste 2500 m altitudine,
    valorile au scazut sub [-10, -8] °C."
-
-Exemple INCORECTE (nu face asa):
-
-  "In Muntenia precipitatiile au fost intre [10, 20] mm."          <- INTERZIS
-  "Vantul a avut viteza medie intre [3, 5] m/s in Banat."          <- INTERZIS
-  "Nebulozitatea medie a fost intre [4, 6] octa pe litoral."       <- INTERZIS
-
-  Toate aceste exemple sunt INCORECTE pentru ca descriu alte variabile
-  in afara de temperatura. Output-ul corect contine NUMAI intervale de
-  temperatura in °C.
 """
 
 
