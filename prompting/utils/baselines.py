@@ -1160,7 +1160,7 @@ def run_autoregressive(
     """
     import matplotlib.pyplot as plt
 
-    input_matrix, target_matrix, dates, _, _ = load_county_matrix(
+    input_matrix, target_matrix, dates, counties, _ = load_county_matrix(
         date_folder, csv_filename, extra_csv_filenames=extra_csv_filenames,
     )
     out_dir = Path(output_dir)
@@ -1316,6 +1316,164 @@ def run_autoregressive(
               f"AR RMSE={ar_rmse.mean():.2f}, "
               f"AR first-chunk={ar_rmse[:H].mean():.2f}, "
               f"AR last-chunk={ar_rmse[-H:].mean():.2f}    -> {out_path.name}")
+
+        # ----- per-county autoregressive distribution: signed-error
+        #       heatmap (LEFT) + predicted class distribution per county
+        #       (MIDDLE) + ground-truth class distribution per county
+        #       (RIGHT). All three panels share the y-axis (sorted by
+        #       descending autoregressive RMSE), so reading a single
+        #       row across the figure gives error structure + prediction
+        #       shape + ground-truth shape for that county at once.
+        signed_error = ar_pred - gt                              # (total_days, n_county)
+        per_county_rmse = np.sqrt((signed_error ** 2).mean(axis=0))
+        # Order counties by overall autoregressive RMSE so the most
+        # error-prone rows cluster at the top of every panel.
+        sort_order = np.argsort(-per_county_rmse)
+        signed_error_sorted = signed_error[:, sort_order]
+        ar_pred_sorted = ar_pred[:, sort_order]                  # for class binning
+        gt_sorted = gt[:, sort_order]                            # for class binning
+        rmse_sorted = per_county_rmse[sort_order]
+        counties_sorted = [counties[i] for i in sort_order]
+
+        n_county = signed_error.shape[1]
+        fig_pc, (ax_heat, ax_bar_pred, ax_bar_gt) = plt.subplots(
+            1, 3,
+            figsize=(total_days * 0.5 + 11, max(11, 0.28 * n_county + 3)),
+            gridspec_kw={"width_ratios": [3.0, 1.1, 1.1]},
+            sharey=True,
+            layout="constrained",
+        )
+
+        # ===== LEFT: signed-error heatmap (rows = county, cols = day) =====
+        vmax_pc = float(np.max(np.abs(signed_error)))
+        im = ax_heat.imshow(
+            signed_error_sorted.T,
+            aspect="auto", cmap="RdBu_r",
+            vmin=-vmax_pc, vmax=vmax_pc,
+            interpolation="nearest",
+        )
+        ax_heat.set_xticks(range(total_days))
+        ax_heat.set_xticklabels(range(1, total_days + 1), fontsize=8)
+        ax_heat.set_yticks(range(n_county))
+        ax_heat.set_yticklabels(counties_sorted, fontsize=7)
+        ax_heat.set_xlabel("day ahead")
+        ax_heat.set_ylabel(
+            "county (sorted, highest autoregressive RMSE on top)"
+        )
+        ax_heat.set_title(
+            "Signed error (prediction − target) per county per day, degC",
+            fontweight="bold", fontsize=12, pad=22,
+        )
+        # Chunk boundaries (vertical lines) + centred chunk labels above the panel
+        for k in range(1, n_chunks):
+            ax_heat.axvline(k * H - 0.5, color="black", linewidth=1.2)
+        for k in range(n_chunks):
+            chunk_mid = (k + 0.5) * H - 0.5
+            ax_heat.text(
+                chunk_mid, -0.85, f"chunk {k + 1}",
+                ha="center", va="bottom",
+                fontsize=8, fontweight="bold", color="black",
+                clip_on=False,
+            )
+        plt.colorbar(
+            im, ax=ax_heat, orientation="horizontal",
+            pad=0.08, fraction=0.04,
+            label="prediction − target (degC)",
+        )
+
+        # ===== RIGHT: per-county predicted class distribution =====
+        # For each county, histogram its `total_days` predictions into
+        # the 32-class temperature scheme used elsewhere in this pipeline.
+        # Plot a stacked horizontal bar per county; segments coloured by
+        # class on the same RdYlBu_r palette (blue=cold, red=hot) so
+        # readers can spot whether the model is dragging predictions
+        # toward a particular temperature regime.
+        edges = temp_class_edges()
+        class_labels_list = temp_class_labels()
+        n_classes = len(class_labels_list)
+        class_cmap = plt.get_cmap("RdYlBu_r", n_classes)
+        class_colors = [class_cmap(k) for k in range(n_classes)]
+
+        per_county_class_counts_pred = np.zeros((n_county, n_classes), dtype=int)
+        per_county_class_counts_gt = np.zeros((n_county, n_classes), dtype=int)
+        for c in range(n_county):
+            counts_p, _ = np.histogram(ar_pred_sorted[:, c], bins=edges)
+            counts_g, _ = np.histogram(gt_sorted[:, c], bins=edges)
+            per_county_class_counts_pred[c] = counts_p
+            per_county_class_counts_gt[c] = counts_g
+
+        def _stack_bars(ax, class_counts, xlabel, title):
+            left = np.zeros(n_county)
+            for k in range(n_classes):
+                counts_k = class_counts[:, k]
+                ax.barh(
+                    np.arange(n_county), counts_k, left=left,
+                    color=class_colors[k], edgecolor="none",
+                    height=0.92,
+                )
+                left += counts_k
+            ax.set_xlim(0, total_days)
+            ax.set_xlabel(xlabel)
+            ax.set_title(title, fontweight="bold", fontsize=12, pad=22)
+            ax.grid(True, alpha=0.3, axis="x")
+
+        _stack_bars(
+            ax_bar_pred, per_county_class_counts_pred,
+            xlabel="number of predicted days",
+            title="Predicted class distribution per county",
+        )
+        _stack_bars(
+            ax_bar_gt, per_county_class_counts_gt,
+            xlabel="number of observed days",
+            title="Target class distribution per county",
+        )
+
+        # Class-temperature colorbar spanning BOTH bar panels at the
+        # bottom, so the reader knows which colour means which
+        # temperature class for both distributions at once.
+        import matplotlib as mpl
+        norm = mpl.colors.BoundaryNorm(np.arange(n_classes + 1) - 0.5, n_classes)
+        sm = mpl.cm.ScalarMappable(cmap=class_cmap, norm=norm)
+        cbar = fig_pc.colorbar(
+            sm, ax=[ax_bar_pred, ax_bar_gt], orientation="horizontal",
+            pad=0.08, fraction=0.04, ticks=range(0, n_classes, 4),
+        )
+        # Label every 4th class to keep the colorbar readable.
+        cbar.ax.set_xticklabels(
+            [class_labels_list[i] for i in range(0, n_classes, 4)],
+            rotation=45, ha="right", fontsize=7,
+        )
+        cbar.set_label("temperature class (degC)", fontsize=8)
+
+        # No manual y-axis inversion here. `imshow` with the default
+        # origin='upper' already inverts the shared y-axis so row 0
+        # (highest autoregressive RMSE after our sort) sits at the
+        # top, and `barh(y=arange(n))` on the same shared axis draws
+        # bar 0 at the top as well. The earlier 2-panel layout called
+        # invert_yaxis() on both axes (two toggles -> no net change);
+        # with three panels three toggles WOULD flip the orientation
+        # and push the chunk labels below the heatmap rows, which is
+        # the previous bug.
+
+        fig_pc.suptitle(
+            f"Per-county autoregressive forecast distribution: "
+            f"{baseline}{f' [{label}]' if label else ''}, fold {fold}\n"
+            f"start_date={start_date}, "
+            f"{n_chunks} chunks of {H} days = {total_days} days, "
+            f"county RMSE range {rmse_sorted.min():.2f}..{rmse_sorted.max():.2f} degC",
+            fontsize=13,
+        )
+        # constrained_layout (set at subplots creation) handles the
+        # shared colorbar across the two bar panels — no tight_layout
+        # call here, which would conflict.
+        pc_path = out_dir / (
+            f"autoregressive_per_county_{baseline}{label_suffix}_"
+            f"fold{fold}_{start_date}_{total_days}d.png"
+        )
+        fig_pc.savefig(pc_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_pc)
+        print(f"  {' ' * (len(baseline) + len(label_suffix))} "
+              f"   per-county heatmap -> {pc_path.name}")
 
 
 # ---------------------------------------------------------------------------

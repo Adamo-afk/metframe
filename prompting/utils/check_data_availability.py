@@ -1896,6 +1896,135 @@ def build_county_daily_nebulosity_csv(
     return metadata
 
 
+def combine_stations_metadata(
+    date_folder: str = "date",
+    by_region_filename: str = "stations_by_region.json",
+    by_climatology_filename: str = "stations_by_climatology.json",
+    by_cardinal_filename: str = "stations_by_regional_cardinal_points.json",
+    output_filename: str = "stations_metadata.json",
+) -> dict:
+    """
+    Merge the three station classification files into one JSON. The
+    output preserves each input under its own top-level key AND adds a
+    `station_to_classifications` inverse lookup so each station can be
+    located in all three taxonomies via a single dict access.
+
+    Used at LLM-prompt-build time: given a Romanian zone name extracted
+    from a GT paragraph (e.g. "litoral", "sud-estul Munteniei",
+    "Muntenia"), the receiving code resolves it to the relevant
+    classification axis and then to a station list.
+
+    The three classification axes:
+
+      - by_region:      region -> county -> [stations]   (7 regions, 41 counties)
+      - by_climatology: zona_climatica -> [stations]     (9 climatic zones)
+      - by_cardinal:    regiune -> {N, S, E, V} -> [stations]  (28 cells)
+
+    Returns:
+        {
+          "metadata": {<source-file provenance>},
+          "by_region": {...},
+          "by_climatology": {...},
+          "by_cardinal": {...},
+          "station_to_classifications": {
+            station: {
+              "region": str | None,
+              "county": str | None,
+              "climatic_zone": str | None,
+              "cardinal_subdivision": str | None,   # e.g. "Banat-Crisana/N"
+            }, ...
+          },
+          "by_climatology_lower_strip": {...},
+          "by_region_lower_strip": {...},
+          "by_cardinal_lower_strip": {...},
+        }
+    """
+    import json
+
+    folder = Path(date_folder)
+    paths = {
+        "by_region": folder / by_region_filename,
+        "by_climatology": folder / by_climatology_filename,
+        "by_cardinal": folder / by_cardinal_filename,
+    }
+    for key, p in paths.items():
+        if not p.is_file():
+            raise FileNotFoundError(f"{key} input not found: {p}")
+
+    raw = {}
+    for key, p in paths.items():
+        with open(p, "r", encoding="utf-8") as f:
+            raw[key] = json.load(f)
+
+    # Extract the actual classifications. The two ANM-style files wrap
+    # the data under `zona_climatica` and `regiune` respectively; the
+    # nested-county file does not.
+    by_region = raw["by_region"]["stations_by_region"]
+    by_climatology = raw["by_climatology"]["zona_climatica"]
+    by_cardinal = raw["by_cardinal"]["regiune"]
+
+    # Inverse lookup: station -> all four classifications. A station
+    # belongs to exactly one region, one county, one climatic zone, and
+    # one cardinal subdivision; anything missing stays None.
+    station_to_class: dict = {}
+    for region, counties in by_region.items():
+        for county, stations in counties.items():
+            for s in stations:
+                rec = station_to_class.setdefault(s, {
+                    "region": None, "county": None,
+                    "climatic_zone": None, "cardinal_subdivision": None,
+                })
+                rec["region"] = region
+                rec["county"] = county
+    for zone, stations in by_climatology.items():
+        for s in stations:
+            rec = station_to_class.setdefault(s, {
+                "region": None, "county": None,
+                "climatic_zone": None, "cardinal_subdivision": None,
+            })
+            rec["climatic_zone"] = zone
+    for region, subdivs in by_cardinal.items():
+        for direction, stations in subdivs.items():
+            for s in stations:
+                rec = station_to_class.setdefault(s, {
+                    "region": None, "county": None,
+                    "climatic_zone": None, "cardinal_subdivision": None,
+                })
+                rec["cardinal_subdivision"] = f"{region}/{direction}"
+
+    result = {
+        "metadata": {
+            "source_files": {key: paths[key].name for key in paths},
+            "n_stations_total": len(station_to_class),
+            "n_regions": len(by_region),
+            "n_counties": sum(len(c) for c in by_region.values()),
+            "n_climatic_zones": len(by_climatology),
+            "n_cardinal_subdivisions": sum(len(c) for c in by_cardinal.values()),
+        },
+        "by_region": by_region,
+        "by_climatology": by_climatology,
+        "by_cardinal": by_cardinal,
+        "station_to_classifications": dict(sorted(station_to_class.items())),
+    }
+
+    output_path = folder / output_filename
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    print(f"Combined stations metadata: {len(station_to_class)} stations")
+    print(f"  by_region:      {len(by_region)} regions, "
+          f"{result['metadata']['n_counties']} counties")
+    print(f"  by_climatology: {len(by_climatology)} zones")
+    print(f"  by_cardinal:    {len(by_cardinal)} regions x up to 4 directions")
+    incomplete = [s for s, r in station_to_class.items()
+                  if not all([r['region'], r['climatic_zone'], r['cardinal_subdivision']])]
+    if incomplete:
+        print(f"  WARNING: {len(incomplete)} station(s) missing one or more "
+              f"classifications: {incomplete[:5]}{'...' if len(incomplete) > 5 else ''}")
+    print(f"Wrote {output_path}")
+    return result
+
+
 def generate_stations_by_region(
     date_folder: str = "date",
     stations_csv: str = "statii_meteo.csv",
@@ -2461,6 +2590,26 @@ def _parse_args() -> argparse.Namespace:
                        default="daily_county_nebulosity_metadata.json",
                        help="Companion JSON filename inside --date_folder.")
 
+    p_cm = subparsers.add_parser(
+        "combine_stations_metadata",
+        help="Merge stations_by_region.json + stations_by_climatology.json "
+             "+ stations_by_regional_cardinal_points.json into a single "
+             "stations_metadata.json with an inverse "
+             "station -> all-classifications lookup. Used by the LLM "
+             "prompt builders for the unified-comparison framework.",
+    )
+    p_cm.add_argument("--date_folder", type=str, default="date",
+                      help="Folder holding the three input JSONs and the merged output.")
+    p_cm.add_argument("--by_region_filename", type=str,
+                      default="stations_by_region.json")
+    p_cm.add_argument("--by_climatology_filename", type=str,
+                      default="stations_by_climatology.json")
+    p_cm.add_argument("--by_cardinal_filename", type=str,
+                      default="stations_by_regional_cardinal_points.json")
+    p_cm.add_argument("--output_filename", type=str,
+                      default="stations_metadata.json",
+                      help="Merged output JSON inside --date_folder.")
+
     return parser.parse_args()
 
 
@@ -2542,4 +2691,12 @@ if __name__ == "__main__":
             obscured_value=args.obscured_value,
             output_filename=args.output_filename,
             metadata_filename=args.metadata_filename,
+        )
+    elif args.command == "combine_stations_metadata":
+        combine_stations_metadata(
+            date_folder=args.date_folder,
+            by_region_filename=args.by_region_filename,
+            by_climatology_filename=args.by_climatology_filename,
+            by_cardinal_filename=args.by_cardinal_filename,
+            output_filename=args.output_filename,
         )
