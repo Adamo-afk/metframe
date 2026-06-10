@@ -14,6 +14,7 @@ Every module in `prompting/utils/` after the cleanup, with its provenance.
 |---|---|---|
 | `check_data_availability.py` | CSV data-quality + preparation utilities. Hosts `check_data_availability` (per-date temporal completeness for the Bucharest hourly CSV) plus a CLI with eight subcommands — `stations`, `monthly_coverage`, `regions`, `temperature`, `county_matrix`, `county_precip`, `county_wind`, `county_nebulosity` — covering cross-file station coverage, per-station monthly-registry audits, the regions/county lookup builder, monthly mean-temperature analysis with neighbour fill, the (T, C) target temperature matrix, and the three auxiliary-variable matrices (precipitation, wind, nebulosity) used as additional input channels by the multi-variable baselines. See "Data preparation utilities" below. | Edited in place |
 | `baselines.py` | Time-series forecasting baselines on the county-day matrices. Six baselines (mean, persistence, linear regression, N-BEATS, iTransformer, PatchTST) under one CLI, with 4-fold expanding-window cross-validation, per-county z-score normalisation (log1p for precipitation), horizon-weighted Huber loss, multi-variable input with temp-only output, per-fold weight checkpoints, run labels for before/after experiments, decoupled training/plotting, and a 32-class temperature classification with target-vs-prediction distribution plots. See "Forecasting baselines" below. | **New** |
+| `llm_comparison.py` | Unified LLM-vs-baseline comparison framework. Three CLI subcommands (`run`, `baseline_eval`, `plot`): runs the (5 input modes × 7 folds) matrix per Ollama LLM, scores each prediction with both the hyperbolic per-station manual algorithm and an OpenAI gpt-5-mini judge, bridges the W=H=6 baseline checkpoints into the same JSON shape so a single plotter merges both. Includes a Romanian zone parser (regions, climatic zones, cardinal subdivisions with diacritic-insensitive matching), a token-limit detector that writes a separate log when prompts truncate or outputs hit `done_reason=length`, and an OpenAI judge client that reads `OPENAI_API_KEY` from the env only. See "LLM-vs-baseline comparison framework" below. | **New** |
 | `config.py` | Calendar split (train/test dates), LoRA hyperparameters, Trainer args | Edited in place |
 | `input_extraction.py` | Extract weather data from CSVs and forecast text from PDFs | **New: combined** `extract_data_from_tables.py` + `extract_pdf_data.py` |
 | `prompt_construction.py` | Build system/user prompt pairs for both PDF-context and GPT-CoT tracks | **New: combined** `create_prompts.py` + `create_prompts_gpt.py` |
@@ -137,6 +138,7 @@ Subcommand summary:
 | `county_precip` | (T, 41) county-day **precipitation** matrix (auxiliary input) | `daily_county_precip.csv` + metadata |
 | `county_wind` | (T, 41) county-day **wind speed** matrix (auxiliary input) | `daily_county_wind.csv` + metadata |
 | `county_nebulosity` | (T, 41) county-day **cloud cover** matrix (auxiliary input) | `daily_county_nebulosity.csv` + metadata |
+| `combine_stations_metadata` | Merge the three station classification axes (region, climatic zone, regional cardinal direction) into one lookup file used by the LLM-vs-baseline comparison framework | `stations_metadata.json` |
 
 ```
 python -m prompting.utils.check_data_availability <subcommand> [--flags]
@@ -353,6 +355,37 @@ Writes `daily_county_nebulosity.csv` (367 × 41, values in `[0, 8]`)
 and `daily_county_nebulosity_metadata.json`. On the 2024 data the
 sentinel breakdown is detailed in the metadata: ~600K `/`, 30,254 `9`
 obscured (filtered), 0 `-999`.
+
+### `combine_stations_metadata` — unified station classification lookup
+
+Merges the three single-axis classification JSONs into a single file
+that the LLM-vs-baseline comparison framework uses to resolve zone
+mentions in Romanian text:
+
+```
+stations_by_region.json                 region   -> county -> [stations]
+stations_by_climatology.json            climatic zone     -> [stations]
+stations_by_regional_cardinal_points.json  region+cardinal -> [stations]
+```
+
+merge into
+
+```
+stations_metadata.json
+  - stations_by_region                  (verbatim)
+  - stations_by_climatology             (verbatim)
+  - stations_by_regional_cardinal_points (verbatim)
+  - stations_by_county                  derived: county -> [stations]
+  - station_to_county                   derived: station -> county
+```
+
+```
+python -m prompting.utils.check_data_availability combine_stations_metadata
+```
+
+Run any time one of the three source files changes. Default 2024 data:
+168 stations, 7 regions, 41 counties, 9 climatic zones, 28 regional
+cardinal-point cells.
 
 ### Combined input shape for the baselines
 
@@ -820,6 +853,386 @@ explicit.
 | `--autoregressive_total_days` | none | Mode switch: skip training and run an N-day autoregressive rollout from saved checkpoints. Requires `--save_weights` to have been used at training time |
 | `--autoregressive_start_date` | none | Required with `--autoregressive_total_days`. First day of the initial input window in `YYYY-MM-DD` |
 | `--autoregressive_fold` | 4 | Which fold's checkpoint to use for the rollout (4 = deployable) |
+
+
+## LLM-vs-baseline comparison framework
+
+`prompting/utils/llm_comparison.py` evaluates open-source Ollama LLMs
+and the forecasting baselines on a common axis: produce a Romanian
+paragraph describing temperature ranges per ANM zone for a target
+month, then score it against the ANM ground-truth paragraph. The
+framework is the bridge between the qualitative ANM-style narrative
+and the quantitative county-day matrix used by the baselines, and it
+produces a single comparison plot that includes both families.
+
+### Three subcommands
+
+| Subcommand | Purpose | Output |
+|---|---|---|
+| `run` | Runs the (5 input modes × 7 folds) test matrix for **one** Ollama LLM and writes a per-model JSON for the plotter | `llm_runs/llm_runs_<model>.json` plus, if any prompt truncates or any output is cut off, an append-only line in `llm_runs/logs/token_limits_<model>.log` |
+| `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known April days, synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
+| `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary and two figure families — per-scenario accuracy curves vs fold size, and manual-vs-judge agreement scatter per model | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png` |
+
+```
+python -m prompting.utils.llm_comparison <subcommand> [--flags]
+```
+
+### Five input modes × two scenarios = 35 evaluations per model
+
+The runner iterates a Cartesian product:
+
+```
+modes:      historic_only        text from past months' ANM diagnoses
+            historic_plus_temp   text + per-zone monthly temperature numbers
+            historic_plus_aux    text + temp + precip + wind + nebulosity
+            temp_only            no text, just per-zone temperature numbers
+            aux_only             no text, no temperature, just aux numbers
+scenarios:  monthly  folds = (3, 6, 9)        K known months -> predict month K+1
+            daily    folds = (6, 12, 18, 24)  K known days   -> predict full month
+                                              (default target = April)
+```
+
+A "fold" here is the number of **known** historical units (months or
+days) the model sees in the user prompt — the scenario analogue of
+the baselines' `--folds` count.
+
+### Zone vocabulary
+
+Every paragraph (GT or model output) is parsed via an exhaustive
+Romanian-language regex + lookup that recognises three classification
+axes simultaneously, with diacritic-insensitive matching so
+`Muntenia` / `muntenia` / `în Muntenia` / `sud-estul Munteniei` all
+resolve correctly:
+
+| Axis | Examples | Resolution |
+|---|---|---|
+| **Region** | `Muntenia`, `Transilvania`, `Banatului`, `nordul Moldovei` | one of the 7 ANM regions, optionally with a cardinal direction (`N`, `S`, `E`, `V`) |
+| **Climatic zone** | `Delta Dunării`, `Litoralul Mării Negre`, `Subcarpaţii`, `Depresiuni intramontane` | one of the 9 ANM climatic zones |
+| **Regional cardinal** | `sud-est`, `nord-vest` | resolved to the first component per spec (`sud-est` → `S`, `nord-vest` → `N`); `interiorul arcului carpatic` maps to `Depresiuni intramontane` |
+
+Each zone record carries `axis`, `ident`, optional `cardinal`, and the
+expanded `stations` list. Used in two places:
+
+- **Prompt construction** — the known months' GT paragraphs are
+  parsed, the zones are deduped across months, and the result becomes
+  the "main regions" the model must cover.
+- **Output parsing** — every sentence of the model's reply is split,
+  zones in the sentence are mapped to the nearest `[a, b]` interval
+  in the same sentence (by character distance, so word order doesn't
+  matter), producing a `{zone, interval}` record per sentence.
+
+### Required output format — the `[x, y]` brackets
+
+The system prompt is explicit:
+
+```
+Output a Romanian paragraph covering every main region listed below.
+For each region (or subdivision) emit a sentence with a temperature
+range of the form [x, y] where x and y are the boundaries of a
+2 degC bin (i.e. y - x = 2 and x is even).
+
+Examples:
+    In Muntenia, mediile lunare au fost cuprinse intre [22, 24] degC.
+    Pe Litoralul Marii Negre, valorile au variat intre [16, 18] degC.
+
+Do NOT use fluent Romanian here for the interval - the post-processor
+will reword [x, y] into "intre x si y degC" automatically.
+```
+
+The post-processor consumes the brackets in two passes:
+
+1. **Parse** each `[a, b]` (rounding to integers; tolerating `oC`,
+   `degC`, `°C`, `C` as units) into the structured `pred_records`
+   list that the manual scorer consumes.
+2. **Rewrite** each `[a, b]` into fluent Romanian (`intre a si b
+   degC`), including the case where the bracket is already preceded
+   by `intre`/`între`, so the duplicate word isn't introduced. Both
+   the raw and the rewritten paragraph are persisted side-by-side
+   in the JSON (`predicted_paragraph_raw` and
+   `predicted_paragraph_fluent`).
+
+### Manual scoring — the hyperbolic per-station distance
+
+The closed-form scorer (`manual_score` in `llm_comparison.py`) takes
+the predicted paragraph + the GT paragraph and produces an accuracy in
+`[0, 1]`. It looks up the **monthly mean** `T(s)` per station for the
+target month (from `temperature_YYYY-MM.json`) and computes:
+
+```
+For each station s in (GT_stations ∪ predicted_stations):
+    let interval = [a, b] if s is predicted, else (None)
+    if s in GT and s in predicted:
+        d(s) = max(0, a - T(s), T(s) - b)                     intersection
+    elif s in GT and s NOT in predicted:
+        d(s) = w                                              missed
+    else:  # predicted, not in GT
+        d(s) = max(point-to-interval distance, w)             false positive
+
+d_bar    = mean over s of d(s)
+accuracy = 1 / (1 + d_bar / w)             hyperbolic; w = 2 degC
+error    = 1 - accuracy
+```
+
+Hyperbolic normalisation maps `d_bar = 0` → accuracy `1.00`, `d_bar =
+w` → `0.50`, `d_bar = 2w` → `0.33`. The penalty `w` for missed
+stations matches the bin width, so a model that doesn't mention any
+zone scores the same as one that names every wrong bin by 2 °C.
+Stations with no usable `T(s)` are counted under `unscorable` but do
+not enter `d_bar`.
+
+The per-evaluation JSON record carries:
+
+```
+manual_score:
+    accuracy        float
+    d_bar           float in degC
+    w               2.0
+    counts          { intersection, missed, false_pos, unscorable }
+```
+
+The full per-station table and the parsed prediction records are kept
+on the in-memory dict but stripped from the persisted JSON to keep
+file sizes tractable across the 35-evaluation matrix.
+
+### LLM-as-judge — OpenAI gpt-5-mini by default
+
+A second, qualitative score comes from a separate language-model
+judge whose system prompt asks for a SINGLE integer 0..100 (the
+percentage of accuracy), no prose. The judge sees **the raw output
+with brackets intact** (not the fluent rewrite), GT paragraph, and
+nothing else — no scenario, mode, or fold metadata, so it's a blind
+pairwise comparison.
+
+```
+JUDGE USER PROMPT:
+    REFERINTA:
+    <full ANM paragraph for the target month>
+
+    PREDICTIE:
+    <raw model output with [x, y] brackets>
+
+    Acuratețe (0-100):
+```
+
+Default backend: **OpenAI Responses API, `gpt-5-mini`, `reasoning.effort=
+"minimal"`, `max_output_tokens=2048`**. The key is read from
+`OPENAI_API_KEY` only — there is no fallback file, no config key, no
+hardcoded literal.
+
+```
+setx OPENAI_API_KEY "sk-..."     # one-time, persisted; reopen terminal after
+```
+
+CLI flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--judge_provider` | `openai` | `openai` or `ollama`. `ollama` routes the judge through a local model so the run is offline (no API calls) |
+| `--judge_model` | `gpt-5-mini` (OpenAI) / `--model` (Ollama) | Override the judge model id |
+
+The OpenAI judge runs in parallel with the Ollama predictor (different
+backends, no VRAM contention). The Ollama judge shares the loaded
+weights with the predictor when `--judge_model == --model`; otherwise
+expect VRAM thrashing unless `$env:OLLAMA_MAX_LOADED_MODELS = "2"` is
+set and you have headroom for both models in GPU.
+
+### Token-limit detection
+
+Every chat call populates a `.last_meta` dict on the client with the
+provider's stop-reason and token usage. After each `(predictor, judge)`
+pair the runner derives a `truncation_flags` block that is persisted
+in the per-evaluation JSON and, **only when something tripped**,
+appended as one human-readable line in
+`llm_runs/logs/token_limits_<model>.log`.
+
+What's caught:
+
+| Condition | Detected via | Meaning |
+|---|---|---|
+| **Output truncated** | Ollama `done_reason == "length"`; OpenAI `incomplete_details.reason == "max_output_tokens"` | The model hit its output cap before finishing. The reply is potentially incomplete |
+| **Input near limit** | Ollama `prompt_eval_count / num_ctx >= 0.95` | Ollama silently drops the front of the messages array when the prompt exceeds `num_ctx`. A fill ratio near 1.0 means content may already be missing from what the model sees. OpenAI raises explicitly, so the error path catches that side |
+
+Healthy runs do not even create the `logs/` directory. The threshold
+`_NEAR_LIMIT_FRACTION = 0.95` lives at the top of the runner section
+in [llm_comparison.py](prompting/utils/llm_comparison.py); easy to tune.
+
+Inspect a specific row's flags from the per-model JSON:
+
+```
+python -c "import json; d = json.load(open('llm_runs/llm_runs_gpt-oss_latest.json', encoding='utf-8')); r = next(x for x in d['results'] if x['scenario']=='monthly' and x['fold_n']==6 and x['mode']=='historic_only'); print(r['truncation_flags'])"
+```
+
+### Bridging the baselines into the LLM JSON shape
+
+`baseline_eval` reuses the existing AR rollout machinery to evaluate
+the W=H=6 baseline checkpoints against the **same daily-scenario
+folds** as the LLMs. The bridge:
+
+1. For each `K ∈ {6, 12, 18, 24}` known-day point on April 2024:
+   - Locate the input window as the **last W = 6** of the K known
+     days (so K=6 uses Apr 1–6, K=12 uses Apr 7–12, …, K=24 uses
+     Apr 19–24).
+   - Run an autoregressive rollout to fill `30 − K` predicted days.
+   - Splice known days (from `daily_county_mean.csv`) + predicted
+     days → a `(30, 41)` full-month per-county DataFrame.
+2. For each zone in the LLM's known-month zone set (i.e. zones
+   deduped from January + February + March ANM paragraphs):
+   - Compute the predicted **monthly mean** across the zone's
+     counties × all 30 days.
+   - Snap to a 2 °C bin `[2·floor(mean/2), 2·floor(mean/2) + 2]`.
+3. Concatenate one sentence per zone into a synthetic paragraph in
+   the same format the LLMs are asked to emit:
+   `"In <zone_label>, mediile lunare au fost cuprinse intre [a, b] °C."`
+4. Score the synthetic paragraph with `manual_score` (and optionally
+   `llm_judge_score`) against the April GT paragraph.
+5. Write `llm_runs/llm_runs_baseline_<baseline>_<label>.json` with
+   the same record schema as `run`. The plotter picks it up
+   automatically — no flags, no extra command.
+
+The retrain-label → LLM-mode map:
+
+```
+--label wh6_target  ->  mode = "temp_only"
+--label wh6_aux     ->  mode = "historic_plus_aux"
+```
+
+so baseline rows overlay LLM rows of the matching input regime in
+the same colour on the comparison curves.
+
+**Perfect-knowledge bound:** running the bridge with the GT daily
+matrix in place of any model's prediction (i.e. an oracle baseline)
+scores manual accuracy ≈ **0.56** on April 2024 (d̄ ≈ 1.57 °C). That
+0.56 is the ceiling — accuracy is bounded above 1.00 because the 2 °C
+floor anchoring discards sub-2 °C precision. Real baselines and LLMs
+sit below this line.
+
+### CLI reference — `run`
+
+Runs the test matrix for ONE Ollama LLM, persisting after every
+evaluation so a crash loses at most one prediction.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--model` | required | Ollama model id, e.g. `gpt-oss:latest`, `llama3.1:70b-instruct-q4_K_S`, `llama3.1:8b-instruct-q4_K_M`, `gemma3:27b-it-q4_K_M` |
+| `--judge_provider` | `openai` | `openai` (default, uses `OPENAI_API_KEY`) or `ollama` for offline runs |
+| `--judge_model` | provider-default | `gpt-5-mini` for OpenAI; `--model` for Ollama |
+| `--dry_run` | off | Use a mock client that returns canned Romanian paragraphs — no HTTP, no GPU. Verifies orchestration end-to-end |
+| `--ollama_base_url` | `http://localhost:11434` | |
+| `--num_ctx` | 32768 | Ollama context window. Largest user prompt we produce is ~16K input tokens, so 32K leaves safe margin |
+| `--temperature` | 0.2 | Low so the `[x, y]` format constraint is consistently honoured |
+| `--keep_alive` | `30m` | Keeps the model loaded in GPU between calls |
+| `--date_folder` | `date` | Holds `stations_metadata.json`, `temperature_*.json`, `daily_county_*.csv`, `historic_data_*.json` |
+| `--historic_data_filename` | `historic_data_2024.json` | |
+| `--year` | 2024 | |
+| `--daily_test_month` | 4 (April) | Month used for the daily scenario; consistent across folds |
+| `--output_dir` | `llm_runs` | Per-model JSON + token-limit log directory |
+| `--modes` | all five | Subset to run; useful for debugging |
+
+### CLI reference — `baseline_eval`
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--baselines_dir` | `baselines` | Holds `checkpoints/` from the W=H=6 retrain |
+| `--output_dir` | `llm_runs` | Where baseline JSONs land (same dir as LLM JSONs so `plot` picks them up) |
+| `--fold` | 4 | Which fold's checkpoint to use (deployable) |
+| `--year` | 2024 | |
+| `--daily_test_month` | 4 (April) | Must match the LLM run's value |
+| `--date_folder` | `date` | |
+| `--historic_data_filename` | `historic_data_2024.json` | |
+| `--use_openai_judge` | off | Also score with gpt-5-mini, mirroring the LLM eval. Manual scoring alone is usually enough for the comparison plot |
+| `--judge_model` | `gpt-5-mini` | OpenAI judge model id when `--use_openai_judge` is set |
+| `--device` | auto | `auto`/`cpu`/`cuda` for the AR rollout |
+
+### CLI reference — `plot`
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--llm_runs_dir` | `llm_runs` | Folder scanned for `llm_runs_*.json` (LLMs and baselines together) |
+| `--output_dir` | `<llm_runs_dir>/plots` | CSV + PNGs land here |
+| `--show` | off | Also call `plt.show()` after writing files |
+
+### End-to-end command set
+
+```cmd
+set PY=C:\Users\sateliti1\AppData\Local\anaconda3\envs\meteollm\python.exe
+cd /d F:\Claudiu\metframe
+
+REM 1. One-time data prep (skip if stations_metadata.json + temperature_*.json + daily_county_*.csv already exist)
+%PY% -m prompting.utils.check_data_availability combine_stations_metadata
+for %m in (01 02 04 05 06 07 08 09 10 11 12) do %PY% -m prompting.utils.check_data_availability temperature --month 2024-%m
+
+REM 2. Retrain the baselines with W=H=6 so a single forward chunk = one LLM daily fold
+%PY% -m prompting.utils.baselines --baseline all --window 6 --horizon 6 --folds 4 ^
+    --patch_len 2 --stride 2 --save_weights --label wh6_target
+%PY% -m prompting.utils.baselines --baseline all --window 6 --horizon 6 --folds 4 ^
+    --patch_len 2 --stride 2 --save_weights --label wh6_aux ^
+    --extra_csvs daily_county_precip.csv daily_county_wind.csv daily_county_nebulosity.csv
+
+REM 3. Bridge the baseline checkpoints into the LLM JSON schema
+%PY% -m prompting.utils.llm_comparison baseline_eval --fold 4
+
+REM 4. Run each Ollama LLM (default judge = OpenAI gpt-5-mini, key from OPENAI_API_KEY)
+%PY% -m prompting.utils.llm_comparison run --model gpt-oss:latest
+%PY% -m prompting.utils.llm_comparison run --model llama3.1:8b-instruct-q4_K_M
+%PY% -m prompting.utils.llm_comparison run --model llama3.1:70b-instruct-q4_K_S
+%PY% -m prompting.utils.llm_comparison run --model gemma3:27b-it-q4_K_M
+
+REM 5. Unified comparison plot (baselines + LLMs overlaid)
+%PY% -m prompting.utils.llm_comparison plot
+```
+
+### Outputs
+
+After the full pipeline:
+
+```
+llm_runs/
+├── llm_runs_gpt-oss_latest.json                       <- one per Ollama model
+├── llm_runs_llama3.1_8b-instruct-q4_K_M.json
+├── llm_runs_llama3.1_70b-instruct-q4_K_S.json
+├── llm_runs_gemma3_27b-it-q4_K_M.json
+│
+├── llm_runs_baseline_linear_regression_wh6_target.json   <- one per baseline x label
+├── llm_runs_baseline_linear_regression_wh6_aux.json
+├── llm_runs_baseline_nbeats_wh6_target.json
+├── ... (8 baseline JSONs total: 4 trained x 2 labels)
+│
+├── logs/
+│   └── token_limits_<model>.log                       <- only if anything tripped
+│
+└── plots/
+    ├── summary.csv                                    <- one row per (model, scenario, fold, mode)
+    ├── llm_manual_accuracy_monthly.png                <- LLMs only (baselines have no monthly scenario)
+    ├── llm_manual_accuracy_daily.png                  <- LLMs + baselines overlaid, colour by mode
+    ├── llm_judge_accuracy_monthly.png
+    ├── llm_judge_accuracy_daily.png
+    └── manual_vs_judge_<model>.png                    <- one per model, y=x ref + Spearman corr
+```
+
+Each per-evaluation record in the JSON contains:
+
+```
+scenario               "monthly" or "daily"
+fold_n                 K (months for monthly, days for daily)
+mode                   one of the five input modes
+target_month           1..12
+year                   2024
+n_zones, zones         the input zone set the model was asked to cover
+gt_paragraph           verbatim ANM paragraph for the target month
+predicted_paragraph_raw    model output with [x, y] intact
+predicted_paragraph_fluent post-processed Romanian
+manual_score           { accuracy, d_bar, w, counts }
+judge_score            { judge_accuracy, judge_score_int, judge_raw_reply }
+truncation_flags       { predictor: {...}, judge: {...} } - see "Token-limit detection"
+input_prompt_chars     len(system) + len(user)
+output_chars           len(predicted_paragraph_raw)
+```
+
+Inspecting a specific row interactively:
+
+```
+python -c "import json; d = json.load(open('llm_runs/llm_runs_gpt-oss_latest.json', encoding='utf-8')); r = next(x for x in d['results'] if x['scenario']=='monthly' and x['fold_n']==6 and x['mode']=='historic_only'); import pprint; pprint.pp(r)"
+```
 
 
 ## Run scenarios

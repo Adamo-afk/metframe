@@ -26,10 +26,32 @@ parser would be.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Romanian month vocabulary
+# ---------------------------------------------------------------------------
+
+ROMANIAN_MONTHS = [
+    "Ianuarie", "Februarie", "Martie", "Aprilie", "Mai", "Iunie",
+    "Iulie", "August", "Septembrie", "Octombrie", "Noiembrie", "Decembrie",
+]
+
+
+def romanian_month_name(month_int: int) -> str:
+    """1-indexed Romanian month name. 1 -> Ianuarie, 12 -> Decembrie."""
+    if not 1 <= month_int <= 12:
+        raise ValueError(f"month_int out of range: {month_int}")
+    return ROMANIAN_MONTHS[month_int - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -569,3 +591,2369 @@ def extract_predictions_from_paragraph(
                 "sentence": sent.strip(),
             })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-zone aggregators
+# ---------------------------------------------------------------------------
+#
+# A "zone record" (the structure returned by extract_zones_from_text /
+# dedupe_zones) carries a list of station IDs. The aggregators below
+# convert that station list into observed monthly or daily values for
+# the four available variables. The two regimes differ:
+#
+#  - Monthly: read temperature_YYYY-MM.json's per_station_mean_celsius
+#    block. For each station in the zone, pull its monthly mean; average
+#    over stations to get the zone-month value.
+#
+#  - Daily: read daily_county_*.csv (mean, precip, wind, nebulosity).
+#    Each station resolves to a county (via metadata); take the mean of
+#    the relevant columns across the counties that contain at least one
+#    station of the zone, equally weighted. This avoids needing the raw
+#    per-station daily series.
+
+
+def _zone_to_counties(zone: Dict, metadata: dict) -> List[str]:
+    """List of county codes that contain at least one of `zone['stations']`."""
+    st2cls = metadata["station_to_classifications"]
+    seen: List[str] = []
+    for s in zone["stations"]:
+        rec = st2cls.get(s)
+        if not rec:
+            continue
+        county = rec.get("county")
+        if county and county not in seen:
+            seen.append(county)
+    return seen
+
+
+def zone_monthly_value(
+    zone: Dict,
+    month_int: int,
+    year: int = 2024,
+    variable: str = "mean_temp",
+    date_folder: str = "date",
+) -> Optional[float]:
+    """
+    Mean monthly value for the zone, computed by averaging the
+    per-station monthly means of the zone's stations.
+
+    `variable` is one of:
+        - 'mean_temp' -> mean_temp from per_station_mean_celsius
+        - 'mean_tmax' / 'mean_tmin'
+
+    Returns None when none of the zone's stations have usable data
+    that month.
+    """
+    valid_keys = {"mean_temp", "mean_tmax", "mean_tmin"}
+    if variable not in valid_keys:
+        raise ValueError(f"variable must be one of {valid_keys}, got {variable!r}")
+
+    path = Path(date_folder) / f"temperature_{year}-{month_int:02d}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} not found. Generate it via the `temperature` subcommand."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    per_station = data.get("per_station_mean_celsius", {})
+
+    vals = []
+    for s in zone["stations"]:
+        rec = per_station.get(s)
+        if rec is None:
+            continue
+        v = rec.get(variable)
+        if v is None:
+            continue
+        vals.append(float(v))
+    if not vals:
+        return None
+    return float(np.mean(vals))
+
+
+def zone_daily_value(
+    zone: Dict,
+    date: pd.Timestamp,
+    matrix: pd.DataFrame,
+) -> Optional[float]:
+    """
+    Mean of `matrix.loc[date, county]` over the counties containing
+    this zone's stations. `matrix` is one of daily_county_mean,
+    daily_county_precip, daily_county_wind, daily_county_nebulosity
+    pre-loaded as a DataFrame indexed by date with county columns.
+    """
+    counties = _zone_to_counties(zone, _zone_metadata_cache())
+    if not counties:
+        return None
+    available = [c for c in counties if c in matrix.columns]
+    if not available:
+        return None
+    try:
+        return float(matrix.loc[date, available].mean())
+    except KeyError:
+        return None
+
+
+# Module-level metadata cache so zone_daily_value doesn't reload on
+# every call. The cache is keyed by absolute path; set explicitly via
+# set_metadata_for_aggregators() in production code.
+_METADATA_CACHE: Dict[str, dict] = {}
+
+
+def set_metadata_for_aggregators(metadata: dict) -> None:
+    """Stash the metadata dict so zone_daily_value can look up station -> county
+    without the caller passing it on every invocation."""
+    _METADATA_CACHE["current"] = metadata
+
+
+def _zone_metadata_cache() -> dict:
+    if "current" not in _METADATA_CACHE:
+        raise RuntimeError(
+            "metadata not set; call set_metadata_for_aggregators(metadata) "
+            "before using zone_daily_value"
+        )
+    return _METADATA_CACHE["current"]
+
+
+def load_county_daily_matrix(
+    csv_filename: str,
+    date_folder: str = "date",
+) -> pd.DataFrame:
+    """Load a daily_county_*.csv into a date-indexed DataFrame."""
+    path = Path(date_folder) / csv_filename
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} not found. Generate it via the county_* subcommands "
+            f"of check_data_availability."
+        )
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    return df
+
+
+# Pretty Romanian phrasing for the zone records, used when echoing
+# zones back to the model in the user prompt. The model's OUTPUT is
+# expected to use natural Romanian wording too, but for input we want
+# unambiguous labels that the model can map back to its own vocabulary.
+def zone_label_romanian(zone: Dict) -> str:
+    """
+    Return a Romanian-language label for the zone record, suitable for
+    use in the user prompt's per-zone section headers.
+    """
+    axis = zone["axis"]
+    ident = zone["ident"]
+    card = zone.get("cardinal")
+    if axis == "climatic":
+        return ident
+    if axis == "region":
+        if card is None:
+            return ident
+        card_word = {"N": "nord", "S": "sud", "E": "est", "V": "vest"}[card]
+        return f"{ident} ({card_word})"
+    if axis == "region_compound":
+        return ident
+    if axis == "region_part":
+        return ident
+    if axis == "subregion":
+        return ident
+    return ident
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_RO = """Esti un meteorolog specializat in caracterizarea climatica a Romaniei.
+Trebuie sa generezi un paragraf in limba romana care descrie temperatura medie
+a aerului pentru o luna data, urmand convențiile ANM (Administratia Nationala
+de Meteorologie).
+
+REGULI DE FORMAT (foarte importante - un algoritm automat va extrage valorile
+din paragraful tau):
+
+1. Paragraful trebuie sa acopere intreaga tara Romania, mentionand fie regiuni
+   intregi (Muntenia, Dobrogea, Moldova, Oltenia, Banat, Crisana, Transilvania,
+   Maramures), fie subdiviziuni dupa puncte cardinale ale unei regiuni (de
+   exemplu: "sud-estul Munteniei", "nord-vestul Banatului"), fie zone climatice
+   (litoral, Delta Dunarii, zona montana, zona montana inalta, depresiuni
+   intramontane, zona de deal si podis, campie).
+
+2. Pentru fiecare zona mentionata, OBLIGATORIU trebuie sa indici intervalul de
+   temperatura intre paranteze drepte in formatul EXACT:
+
+       [x, y]
+
+   unde x si y sunt valori numerice in grade Celsius, iar diferenta y - x
+   trebuie sa fie de EXACT 2 grade (binul standard ANM de 2 °C). De exemplu:
+   [0, 2], [-4, -2], [10, 12]. Nu folosi alte formate (nu folosi "intre x si
+   y", nu folosi "x..y", nu folosi paranteze rotunde sau acolade).
+
+3. Fiecare propozitie trebuie sa contina cel putin o referire la o zona si
+   cel putin un interval [x, y]. Daca o propozitie mentioneaza mai multe
+   zone, intervalul se aplica tuturor zonelor mentionate in acea propozitie.
+
+4. Acopera intreaga tara. Toate marile regiuni (Muntenia, Moldova, Oltenia,
+   Transilvania, Banat-Crisana, Maramures, Dobrogea) trebuie sa fie acoperite
+   fie direct, fie prin subdiviziuni cardinale sau zone climatice.
+
+5. Genereaza UN SINGUR paragraf coerent, fara titluri sau sub-secțiuni.
+   Limbajul trebuie sa fie similar cu cel folosit in caracterizările lunare
+   ANM oficiale.
+
+6. NU adauga comentarii, explicații sau metadate dupa paragraf. Output-ul
+   trebuie sa fie EXCLUSIV paragraful, nimic altceva.
+
+Exemple corecte de fragmente:
+
+  "Mediile lunare de temperatura au fost cuprinse intre [0, 2] °C in Muntenia,
+   in cea mai mare parte a Dobrogei si Olteniei."
+
+  "Pe litoral si in Delta Dunarii valorile au depasit [2, 4] °C, in timp ce in
+   sud-estul Munteniei mediile au variat intre [-2, 0] °C."
+
+  "In zona montana inalta temperatura medie lunara a fost cuprinsa intre
+   [-8, -6] °C, iar pe creste, la peste 2500 m altitudine, valorile au scazut
+   sub [-10, -8] °C."
+"""
+
+
+def build_system_prompt() -> str:
+    """Return the Romanian system prompt with the strict [x, y] format requirement."""
+    return SYSTEM_PROMPT_RO
+
+
+# ---------------------------------------------------------------------------
+# User prompt builders
+# ---------------------------------------------------------------------------
+#
+# Five input modes x two scenarios. Each builder receives:
+#   - the extracted+deduplicated zones for the run
+#   - the test target identifier (target month for both scenarios)
+#   - the relevant data sources (historic paragraphs, monthly stats,
+#     daily matrices)
+# and returns the user prompt string.
+
+
+MODES = (
+    "historic_only",
+    "historic_plus_temp",
+    "historic_plus_aux",
+    "temp_only",
+    "aux_only",
+)
+
+SCENARIOS = ("monthly", "daily")
+
+
+def _format_zone_monthly_block(
+    zone: Dict,
+    months: List[int],
+    year: int,
+    include_temp: bool,
+    include_aux: bool,
+    date_folder: str = "date",
+    aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+) -> str:
+    """One zone's monthly evolution block. Used by the monthly scenario."""
+    lines = [f"  [{zone_label_romanian(zone)}]"]
+    if include_temp or include_aux:
+        for m in months:
+            month_label = romanian_month_name(m)
+            temp = zone_monthly_value(
+                zone, month_int=m, year=year, variable="mean_temp",
+                date_folder=date_folder,
+            )
+            parts = []
+            if include_temp and temp is not None:
+                parts.append(f"temperatura medie = {temp:.2f} °C")
+            if include_aux and aux_matrices is not None:
+                # For aux in the MONTHLY scenario we take the monthly
+                # mean of each daily aux matrix over the month's days.
+                month_dates = pd.date_range(
+                    f"{year}-{m:02d}-01", periods=31, freq="D",
+                ).intersection(aux_matrices["precip"].index)
+                month_dates = [
+                    d for d in month_dates if d.month == m and d.year == year
+                ]
+                if month_dates:
+                    precip = float(
+                        aux_matrices["precip"]
+                        .loc[month_dates, _zone_to_counties(zone, _zone_metadata_cache())]
+                        .filter(items=aux_matrices["precip"].columns)
+                        .mean()
+                        .mean()
+                    ) if zone["stations"] else None
+                    wind = float(
+                        aux_matrices["wind"]
+                        .loc[month_dates, _zone_to_counties(zone, _zone_metadata_cache())]
+                        .filter(items=aux_matrices["wind"].columns)
+                        .mean()
+                        .mean()
+                    ) if zone["stations"] else None
+                    neb = float(
+                        aux_matrices["nebulosity"]
+                        .loc[month_dates, _zone_to_counties(zone, _zone_metadata_cache())]
+                        .filter(items=aux_matrices["nebulosity"].columns)
+                        .mean()
+                        .mean()
+                    ) if zone["stations"] else None
+                    if precip is not None and not np.isnan(precip):
+                        parts.append(f"precipitatii = {precip:.2f} mm/zi")
+                    if wind is not None and not np.isnan(wind):
+                        parts.append(f"vant = {wind:.2f} m/s")
+                    if neb is not None and not np.isnan(neb):
+                        parts.append(f"nebulozitate = {neb:.2f} octanti")
+            if parts:
+                lines.append(f"    {month_label}: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_zone_daily_block(
+    zone: Dict,
+    target_month: int,
+    target_year: int,
+    n_known_days: int,
+    include_temp: bool,
+    include_aux: bool,
+    aux_matrices: Dict[str, pd.DataFrame],
+) -> str:
+    """One zone's daily evolution block. Used by the daily scenario."""
+    lines = [f"  [{zone_label_romanian(zone)}]"]
+    counties = [
+        c for c in _zone_to_counties(zone, _zone_metadata_cache())
+        if c in aux_matrices["temp"].columns
+    ]
+    if not counties:
+        lines.append("    (no stations resolvable to county-day matrices)")
+        return "\n".join(lines)
+    month_start = pd.Timestamp(year=target_year, month=target_month, day=1)
+    dates = pd.date_range(month_start, periods=n_known_days, freq="D")
+    dates = [d for d in dates if d in aux_matrices["temp"].index]
+    for d in dates:
+        parts = []
+        if include_temp:
+            temp = float(aux_matrices["temp"].loc[d, counties].mean())
+            parts.append(f"temp = {temp:.2f} °C")
+        if include_aux:
+            precip = float(aux_matrices["precip"].loc[d, counties].mean()) \
+                if "precip" in aux_matrices else None
+            wind = float(aux_matrices["wind"].loc[d, counties].mean()) \
+                if "wind" in aux_matrices else None
+            neb = float(aux_matrices["nebulosity"].loc[d, counties].mean()) \
+                if "nebulosity" in aux_matrices else None
+            if precip is not None:
+                parts.append(f"precipitatii = {precip:.2f} mm")
+            if wind is not None:
+                parts.append(f"vant = {wind:.2f} m/s")
+            if neb is not None:
+                parts.append(f"nebulozitate = {neb:.2f}")
+        lines.append(f"    {d.strftime('%Y-%m-%d')}: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def build_user_prompt_monthly(
+    *,
+    fold_n: int,
+    target_month: int,
+    year: int,
+    mode: str,
+    historic_paragraphs: Dict[str, str],
+    zones: List[Dict],
+    aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+    date_folder: str = "date",
+) -> str:
+    """
+    Build the monthly-scenario user prompt.
+
+    Args:
+        fold_n: 3, 6, or 9 - the number of known months prior to the target.
+        target_month: 1-indexed month to predict.
+        year: 2024.
+        mode: one of MODES.
+        historic_paragraphs: {romanian_month_name: paragraph} for known months.
+        zones: deduplicated zone records extracted from those paragraphs.
+        aux_matrices: required for modes that include aux; dict of pd.DataFrame
+            keyed by 'temp', 'precip', 'wind', 'nebulosity'.
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+
+    known_months = list(range(target_month - fold_n, target_month))
+    if any(m < 1 for m in known_months):
+        raise ValueError(
+            f"target_month={target_month} with fold_n={fold_n} requires "
+            f"months in 1..12; need at least {fold_n} months before it"
+        )
+
+    target_label = romanian_month_name(target_month)
+    known_labels = [romanian_month_name(m) for m in known_months]
+
+    parts = [
+        f"Cunoastem caracterizarile climatice si/sau datele observate pentru "
+        f"lunile {', '.join(known_labels)} {year}.",
+        f"Genereaza paragraful de caracterizare climatica pentru luna "
+        f"{target_label} {year} folosind aceleasi conventii ca in exemple.",
+        "",
+        "Zonele acoperite in paragraf trebuie sa includa cel putin urmatoarele "
+        "(extrase din caracterizarile lunilor cunoscute, dupa deduplicare):",
+    ]
+    for z in zones:
+        parts.append(f"  - {zone_label_romanian(z)}")
+    parts.append("")
+
+    if mode in ("historic_only", "historic_plus_temp", "historic_plus_aux"):
+        parts.append("CARACTERIZARI ISTORICE (din arhiva ANM):")
+        for m, label in zip(known_months, known_labels):
+            para = historic_paragraphs.get(label, "")
+            if para:
+                parts.append(f"  {label}: {para}")
+        parts.append("")
+
+    if mode in ("historic_plus_temp", "historic_plus_aux",
+                "temp_only", "aux_only"):
+        include_temp = mode in ("historic_plus_temp", "historic_plus_aux", "temp_only")
+        include_aux = mode in ("historic_plus_aux", "aux_only")
+        if include_temp and include_aux:
+            header = "DATE OBSERVATE (temperatura medie + auxiliare per zona, lunar):"
+        elif include_temp:
+            header = "DATE OBSERVATE (temperatura medie per zona, lunar):"
+        else:
+            header = "DATE OBSERVATE (variabile auxiliare per zona, lunar):"
+        parts.append(header)
+        for z in zones:
+            parts.append(
+                _format_zone_monthly_block(
+                    z, known_months, year,
+                    include_temp=include_temp,
+                    include_aux=include_aux,
+                    date_folder=date_folder,
+                    aux_matrices=aux_matrices,
+                )
+            )
+        parts.append("")
+
+    parts.append(
+        f"Genereaza acum paragraful pentru {target_label} {year}, "
+        f"respectand regulile de format si folosind intervalele [x, y]."
+    )
+    return "\n".join(parts)
+
+
+def build_user_prompt_daily(
+    *,
+    n_known_days: int,
+    target_month: int,
+    year: int,
+    mode: str,
+    historic_paragraphs: Dict[str, str],
+    zones: List[Dict],
+    aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+) -> str:
+    """
+    Build the daily-scenario user prompt.
+
+    The model knows the first `n_known_days` of the target month (per zone,
+    daily observed values) and the historic paragraphs of all months PRIOR
+    to the target month. It must produce the FULL-month caracterizare.
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+
+    target_label = romanian_month_name(target_month)
+    # Previous months for the historic-paragraph context.
+    previous_months = list(range(1, target_month))
+    previous_labels = [romanian_month_name(m) for m in previous_months]
+
+    parts = [
+        f"Cunoastem caracterizarile climatice ale lunilor anterioare "
+        f"{', '.join(previous_labels) if previous_labels else '(niciuna disponibila)'} {year}, "
+        f"si datele observate zilnic pentru primele {n_known_days} zile ale lunii "
+        f"{target_label} {year}.",
+        "",
+        f"Genereaza paragraful de caracterizare climatica pentru INTREAGA luna "
+        f"{target_label} {year}, tinand cont ca doar primele {n_known_days} zile "
+        f"sunt cunoscute - restul lunii trebuie sa fie prognozat ca o "
+        f"extensie autoregresiva a tendintei observate.",
+        "",
+        "Zonele acoperite in paragraf trebuie sa includa cel putin urmatoarele "
+        "(extrase din caracterizarile lunilor anterioare, dupa deduplicare):",
+    ]
+    for z in zones:
+        parts.append(f"  - {zone_label_romanian(z)}")
+    parts.append("")
+
+    if mode in ("historic_only", "historic_plus_temp", "historic_plus_aux"):
+        if previous_labels:
+            parts.append("CARACTERIZARI ISTORICE (lunile anterioare lunii prognozate):")
+            for m, label in zip(previous_months, previous_labels):
+                para = historic_paragraphs.get(label, "")
+                if para:
+                    parts.append(f"  {label}: {para}")
+            parts.append("")
+
+    if mode in ("historic_plus_temp", "historic_plus_aux",
+                "temp_only", "aux_only"):
+        include_temp = mode in ("historic_plus_temp", "historic_plus_aux", "temp_only")
+        include_aux = mode in ("historic_plus_aux", "aux_only")
+        if include_temp and include_aux:
+            header = (
+                f"DATE OBSERVATE ZILNIC (temperatura + auxiliare per zona, "
+                f"primele {n_known_days} zile din {target_label} {year}):"
+            )
+        elif include_temp:
+            header = (
+                f"DATE OBSERVATE ZILNIC (temperatura medie per zona, "
+                f"primele {n_known_days} zile din {target_label} {year}):"
+            )
+        else:
+            header = (
+                f"DATE OBSERVATE ZILNIC (variabile auxiliare per zona, "
+                f"primele {n_known_days} zile din {target_label} {year}):"
+            )
+        parts.append(header)
+        if aux_matrices is None:
+            raise ValueError(
+                "aux_matrices is required for daily-scenario modes that include "
+                "temp or aux"
+            )
+        for z in zones:
+            parts.append(
+                _format_zone_daily_block(
+                    z, target_month, year, n_known_days,
+                    include_temp=include_temp,
+                    include_aux=include_aux,
+                    aux_matrices=aux_matrices,
+                )
+            )
+        parts.append("")
+
+    parts.append(
+        f"Genereaza acum paragraful pentru intreaga luna {target_label} {year}, "
+        f"respectand regulile de format si folosind intervalele [x, y]."
+    )
+    return "\n".join(parts)
+
+
+# Driver helper: given a scenario + fold + mode, extract the zones from
+# the right historic paragraphs and build the prompt. This is the
+# function the runner will call per (model, mode, scenario, fold).
+def build_prompt_pair(
+    *,
+    scenario: str,
+    fold_n: int,
+    mode: str,
+    target_month: int,
+    year: int,
+    historic_data_path: str | Path,
+    metadata: dict,
+    aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+    date_folder: str = "date",
+) -> Tuple[str, str, List[Dict], str]:
+    """
+    Returns (system_prompt, user_prompt, deduped_zones, gt_paragraph).
+
+    `gt_paragraph` is the historic_data paragraph for the target month
+    (kept alongside so the scoring code has a single object to consume).
+    """
+    if scenario not in SCENARIOS:
+        raise ValueError(f"scenario must be one of {SCENARIOS}, got {scenario!r}")
+
+    with open(historic_data_path, "r", encoding="utf-8") as f:
+        historic = json.load(f)
+    paragraphs: Dict[str, str] = historic["caracterizare_lunara"]
+    gt_paragraph = paragraphs.get(romanian_month_name(target_month), "")
+
+    set_metadata_for_aggregators(metadata)
+
+    if scenario == "monthly":
+        known_months = list(range(target_month - fold_n, target_month))
+    else:
+        # Daily: zones extracted from ALL previous months (to maximise
+        # vocabulary). Per the user's spec the dedup happens via
+        # dedupe_zones.
+        known_months = list(range(1, target_month))
+
+    if any(m < 1 for m in known_months):
+        raise ValueError(
+            f"target_month={target_month}, fold_n={fold_n}: not enough "
+            f"prior months in the same year for this combination"
+        )
+
+    # Extract + dedupe zones from the known months' GT paragraphs.
+    all_zones: List[Dict] = []
+    for m in known_months:
+        para = paragraphs.get(romanian_month_name(m), "")
+        if para:
+            all_zones.extend(extract_zones_from_text(para, metadata))
+    zones = dedupe_zones(all_zones)
+
+    system_prompt = build_system_prompt()
+    if scenario == "monthly":
+        user_prompt = build_user_prompt_monthly(
+            fold_n=fold_n, target_month=target_month, year=year, mode=mode,
+            historic_paragraphs=paragraphs, zones=zones,
+            aux_matrices=aux_matrices, date_folder=date_folder,
+        )
+    else:
+        user_prompt = build_user_prompt_daily(
+            n_known_days=fold_n, target_month=target_month, year=year, mode=mode,
+            historic_paragraphs=paragraphs, zones=zones,
+            aux_matrices=aux_matrices,
+        )
+
+    return system_prompt, user_prompt, zones, gt_paragraph
+
+
+# ---------------------------------------------------------------------------
+# Post-processing [x, y] -> fluent Romanian
+# ---------------------------------------------------------------------------
+
+# The fluent-Romanian rewriter consumes (optionally) the preceding
+# 'intre' / 'între' word AND the bracket AND any trailing unit, so a
+# model output like 'cuprinse intre [0, 2] °C' doesn't become
+# 'cuprinse intre intre 0 si 2 °C'. Unit forms covered: '°C', 'oC',
+# 'C', 'degC'. The whole construct is replaced with a single fluent
+# 'intre X si Y °C'.
+_FLUENT_REWRITE_RE = re.compile(
+    r"(?:\b(?:intre|într?e)\s+)?"                       # optional 'intre' word
+    r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
+    r"(?:\s*(?:\xb0\s*[Cc]|deg\s*[Cc]|[Cc]))?",          # optional unit
+    flags=re.IGNORECASE,
+)
+
+
+def _format_brackets_replacement(match: "re.Match") -> str:
+    x = float(match.group(1))
+    y = float(match.group(2))
+
+    def _fmt(v: float) -> str:
+        return f"{v:.0f}" if float(v).is_integer() else f"{v:g}"
+
+    return f"intre {_fmt(x)} si {_fmt(y)} °C"
+
+
+def postprocess_brackets_to_fluent_romanian(text: str) -> str:
+    """
+    Rewrite every '[x, y]' (optionally preceded by 'intre' / 'între'
+    and optionally followed by '°C' / 'degC' / 'C') as a fluent Romanian
+    'intre x si y °C'. Leaves the rest of the paragraph untouched.
+
+    The structured form should be kept alongside the post-processed
+    form when persisting LLM outputs - the scorer needs the raw
+    brackets, the reader wants the fluent text.
+    """
+    return _FLUENT_REWRITE_RE.sub(_format_brackets_replacement, text)
+
+
+# ---------------------------------------------------------------------------
+# Manual scoring algorithm
+# ---------------------------------------------------------------------------
+#
+# Per-station distance d(s):
+#
+#   d(s) = dist(T(s), [a, b])              if s in S_GT ∩ S_pred
+#   d(s) = w                                if s in S_GT \\ S_pred  (missed)
+#   d(s) = max(dist(T(s), [a, b]), w)       if s in S_pred \\ S_GT  (false +)
+#
+#   dist(T, [a, b]) = a - T   if T < a
+#                   = T - b   if T > b
+#                   = 0       if T ∈ [a, b]
+#
+# Aggregation:
+#   d_bar = mean of d(s) over S_eval = (S_GT ∪ S_pred) restricted to
+#           stations with usable T(s) data.
+#
+# Normalisation:
+#   accuracy = 1 / (1 + d_bar / w)        in [0, 1]
+#
+# Maps d_bar=0 -> 100%, d_bar=w -> 50%, d_bar=2w -> 33%, etc.
+
+
+def _point_to_interval_distance(T: float, a: float, b: float) -> float:
+    """L1 distance from a scalar to a closed interval. 0 when T ∈ [a, b]."""
+    if T < a:
+        return a - T
+    if T > b:
+        return T - b
+    return 0.0
+
+
+def _build_station_intervals(
+    predicted_records: List[Dict],
+) -> Dict[str, List[float]]:
+    """
+    Collapse the per-zone predicted intervals into a per-station
+    interval map. When a station belongs to multiple predicted zones
+    (the LLM mentioned it under both 'Muntenia' and 'sud-estul
+    Munteniei', say), we take the LAST mention's interval - matching
+    the natural reading order in Romanian paragraphs where the more
+    specific phrasing tends to come second.
+    """
+    station_to_interval: Dict[str, List[float]] = {}
+    for rec in predicted_records:
+        a, b = rec["interval"]
+        for s in rec["stations"]:
+            station_to_interval[s] = [float(a), float(b)]
+    return station_to_interval
+
+
+def _build_gt_station_set(gt_paragraph: str, metadata: dict) -> List[str]:
+    """All stations that fall under any zone mentioned in the GT paragraph."""
+    zones = extract_zones_from_text(gt_paragraph, metadata)
+    seen: List[str] = []
+    for z in zones:
+        for s in z["stations"]:
+            if s not in seen:
+                seen.append(s)
+    return seen
+
+
+def _load_station_temperatures_for_month(
+    target_month: int, year: int, date_folder: str = "date",
+) -> Dict[str, float]:
+    """{station: monthly_mean_temp} from temperature_YYYY-MM.json. Stations
+    with no usable data that month are omitted (-> excluded from S_eval)."""
+    path = Path(date_folder) / f"temperature_{year}-{target_month:02d}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} not found. Generate via the `temperature` subcommand."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    per_station = data.get("per_station_mean_celsius", {})
+    return {s: float(rec["mean_temp"]) for s, rec in per_station.items()
+            if rec.get("mean_temp") is not None}
+
+
+def manual_score(
+    *,
+    predicted_paragraph: str,
+    gt_paragraph: str,
+    target_month: int,
+    year: int,
+    metadata: dict,
+    date_folder: str = "date",
+    bin_width: float = 2.0,
+) -> Dict:
+    """
+    Implement the hyperbolic per-station scoring algorithm from the
+    user's spec. T(s) is the monthly mean of each station for the
+    target month - both monthly and daily scenarios use this same
+    target because in both cases the LLM is being asked for the
+    full-month characterisation.
+
+    Args:
+        predicted_paragraph: LLM output following the [x, y] format.
+        gt_paragraph:        ANM historic_data_yyyy.json paragraph.
+        target_month, year:  used to look up the per-station monthly mean.
+        metadata:            stations_metadata.json contents.
+        bin_width:           w in the formula; 2 °C per spec.
+
+    Returns:
+        {
+            'accuracy':        float in [0, 1],
+            'error_pct':       float in [0, 1]  (= 1 - accuracy),
+            'd_bar':           float (mean per-station distance, °C),
+            'w':               bin_width,
+            'counts': {
+                'intersection': int,
+                'missed':       int,
+                'false_pos':    int,
+                'unscorable':   int    # stations w/ no T(s) data
+            },
+            'per_station': [
+                {station, T, interval, d, category}, ...
+            ],
+            'pred_zones': [...],
+            'pred_records': [...],
+        }
+    """
+    # Per-station target temperatures for the target month.
+    T_per_station = _load_station_temperatures_for_month(
+        target_month, year, date_folder=date_folder,
+    )
+
+    # GT side: any station under any zone mentioned in the GT paragraph.
+    gt_stations = set(_build_gt_station_set(gt_paragraph, metadata))
+
+    # Pred side: extract (zone, interval) records, then collapse to
+    # station -> interval. If the model produced zero parseable
+    # intervals, every GT station becomes missed and the score is the
+    # flat-w penalty.
+    pred_records = extract_predictions_from_paragraph(
+        predicted_paragraph, metadata,
+    )
+    station_to_interval = _build_station_intervals(pred_records)
+    pred_stations = set(station_to_interval.keys())
+
+    # S_eval = stations with both a usable T(s) AND a non-empty role on
+    # at least one side.
+    all_stations = gt_stations | pred_stations
+
+    per_station: List[Dict] = []
+    n_intersection = n_missed = n_false_pos = n_unscorable = 0
+    distances: List[float] = []
+    for s in sorted(all_stations):
+        T = T_per_station.get(s)
+        if T is None:
+            n_unscorable += 1
+            per_station.append({
+                "station": s,
+                "T": None,
+                "interval": station_to_interval.get(s),
+                "d": None,
+                "category": "unscorable",
+            })
+            continue
+        in_gt = s in gt_stations
+        in_pred = s in pred_stations
+        if in_gt and in_pred:
+            a, b = station_to_interval[s]
+            d = _point_to_interval_distance(T, a, b)
+            cat = "intersection"
+            n_intersection += 1
+        elif in_gt and not in_pred:
+            d = bin_width
+            cat = "missed"
+            n_missed += 1
+        else:  # in_pred and not in_gt
+            a, b = station_to_interval[s]
+            d = max(_point_to_interval_distance(T, a, b), bin_width)
+            cat = "false_positive"
+            n_false_pos += 1
+        distances.append(d)
+        per_station.append({
+            "station": s,
+            "T": T,
+            "interval": station_to_interval.get(s),
+            "d": d,
+            "category": cat,
+        })
+
+    if not distances:
+        # No scorable stations. Pretend d_bar = w (i.e. all missed).
+        d_bar = bin_width
+    else:
+        d_bar = float(np.mean(distances))
+
+    accuracy = 1.0 / (1.0 + d_bar / bin_width)
+    error_pct = 1.0 - accuracy
+
+    return {
+        "accuracy": accuracy,
+        "error_pct": error_pct,
+        "d_bar": d_bar,
+        "w": bin_width,
+        "counts": {
+            "intersection": n_intersection,
+            "missed": n_missed,
+            "false_pos": n_false_pos,
+            "unscorable": n_unscorable,
+        },
+        "per_station": per_station,
+        "pred_records": [
+            {k: v for k, v in r.items() if k != "stations"}
+            for r in pred_records
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-a-judge scorer
+# ---------------------------------------------------------------------------
+
+JUDGE_SYSTEM_PROMPT_RO = """Esti un evaluator climatic specializat. Vei primi
+doua paragrafe:
+
+  1) Paragraful de referinta (adevarul, asa cum apare in arhiva ANM).
+  2) Paragraful generat (predictia unui model).
+
+Compara cele doua paragrafe si determina cat de exact este paragraful
+generat fata de referinta. Considera:
+
+  - Acoperirea geografica (aceleasi regiuni, zone climatice, subdiviziuni
+    cardinale sunt mentionate).
+  - Acuratețea intervalelor de temperatura (intervalele predictiei se
+    suprapun cu ce ar fi spus referinta).
+  - Consistența cu structura de caracterizare ANM.
+
+Returneaza UN SINGUR numar intreg intre 0 si 100, reprezentand procentul
+de acuratețe (100 = identice ca informație, 0 = complet gresit). NU
+adauga explicații, comentarii sau text suplimentar - DOAR numarul.
+"""
+
+JUDGE_USER_PROMPT_TEMPLATE = """REFERINTA:
+{gt}
+
+PREDICTIE:
+{pred}
+
+Acuratețe (0-100):"""
+
+
+def build_judge_prompt(gt_paragraph: str, predicted_paragraph: str) -> Tuple[str, str]:
+    """Return (system, user) prompts for the LLM-as-a-judge scorer."""
+    return (
+        JUDGE_SYSTEM_PROMPT_RO,
+        JUDGE_USER_PROMPT_TEMPLATE.format(
+            gt=gt_paragraph.strip(),
+            pred=predicted_paragraph.strip(),
+        ),
+    )
+
+
+# Robust integer-percentage extractor. The judge prompt asks for "a
+# single integer 0-100" but a model might wrap it in punctuation,
+# emit a percent sign, add a leading newline, or even reply with
+# something like "Acuratețe: 73%". This regex finds the FIRST integer
+# in [0, 100] in the reply, optionally followed by a '%'.
+_PERCENT_RE = re.compile(r"(?<![-\d.])(\d{1,3})(?:\s*%)?(?![.\d])")
+
+
+def parse_judge_score(reply: str) -> Optional[int]:
+    """
+    Extract the 0..100 integer the judge was asked to return. Returns
+    None if no plausible integer can be parsed (the runner should
+    treat this as a missing score and log it).
+    """
+    if not reply:
+        return None
+    for m in _PERCENT_RE.finditer(reply):
+        v = int(m.group(1))
+        if 0 <= v <= 100:
+            return v
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Ollama client wrapper
+# ---------------------------------------------------------------------------
+#
+# Talks to a local Ollama HTTP API (default http://localhost:11434).
+# Per-call options:
+#   - num_ctx: lifted from Ollama's 4K-8K default to a value that fits
+#              the largest prompt our runner will produce (~16K input
+#              tokens plus headroom). Default 32768; configurable per
+#              model.
+#   - keep_alive: keep the model loaded in GPU between calls so the
+#              hot-path through (5 modes x 4 folds) doesn't pay the
+#              load-from-disk cost on every iteration. "30m" is plenty
+#              for one model's full pass.
+#   - temperature: low (0.2) so the [x, y] format constraint is more
+#              consistently honoured.
+#
+# This client is intentionally PER-MODEL. Different models can run
+# with different num_ctx settings (gpt-oss has a larger context than
+# the q4_K_M llama models). The runner instantiates one client per
+# model in the iteration.
+
+_OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434"
+_OLLAMA_DEFAULT_NUM_CTX = 32768
+_OLLAMA_DEFAULT_KEEP_ALIVE = "30m"
+_OLLAMA_DEFAULT_TEMPERATURE = 0.2
+
+
+class OllamaClient:
+    """
+    Thin wrapper around Ollama's /api/chat endpoint. Stateless between
+    calls - each chat() invocation is an independent (system, user)
+    request, but the model stays warm in GPU thanks to keep_alive.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str = _OLLAMA_DEFAULT_BASE_URL,
+        num_ctx: int = _OLLAMA_DEFAULT_NUM_CTX,
+        temperature: float = _OLLAMA_DEFAULT_TEMPERATURE,
+        keep_alive: str = _OLLAMA_DEFAULT_KEEP_ALIVE,
+        timeout_s: int = 600,
+        auth_token: Optional[str] = None,
+    ):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.num_ctx = num_ctx
+        self.temperature = temperature
+        self.keep_alive = keep_alive
+        self.timeout_s = timeout_s
+        self.auth_token = auth_token
+        self.last_meta: Dict = {}
+
+    def chat(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Send a (system, user) chat to Ollama, return the assistant's
+        reply as a string. Raises requests.HTTPError on transport
+        failure; the runner should treat that as a missing prediction
+        (and surface in the JSON).
+
+        Side effect: populates self.last_meta with token-usage and
+        stop-reason fields so the runner can detect input truncation
+        and output cut-offs.
+        """
+        import requests  # local import keeps llm_comparison usable without HTTP
+        self.last_meta = {}
+        url = f"{self.base_url}/api/chat"
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {
+                "num_ctx": self.num_ctx,
+                "temperature": self.temperature,
+            },
+            "stream": False,
+            "keep_alive": self.keep_alive,
+        }
+        resp = requests.post(
+            url, json=payload, headers=headers, timeout=self.timeout_s,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if "message" not in body or "content" not in body["message"]:
+            raise RuntimeError(
+                f"unexpected Ollama response shape: {list(body.keys())}"
+            )
+        self.last_meta = {
+            "provider": "ollama",
+            "model": self.model,
+            "num_ctx": self.num_ctx,
+            "input_tokens": body.get("prompt_eval_count"),
+            "output_tokens": body.get("eval_count"),
+            "done_reason": body.get("done_reason"),
+        }
+        return body["message"]["content"]
+
+
+class MockOllamaClient:
+    """
+    Drop-in replacement for OllamaClient that returns canned Romanian
+    paragraphs in the [x, y] format, without any HTTP calls. Used by
+    --dry_run to validate the runner's orchestration end-to-end before
+    any real GPU time gets spent.
+
+    The fake reply is deterministic given the (model_id, fold, mode,
+    scenario) signature embedded in the user prompt, so the same
+    dry-run invocation produces the same outputs every time and
+    differences across modes/folds are visible.
+    """
+
+    _CANNED_TEMPLATE = (
+        "Mediile lunare de temperatura au fost cuprinse intre [{a1}, {b1}] °C "
+        "in Muntenia, in Dobrogei, in Olteniei si in Banatului. "
+        "Pe litoral si in Delta Dunarii, mediile au fost intre [{a2}, {b2}] °C. "
+        "In sud-estul Munteniei si in nordul Moldovei, intervalul a fost "
+        "[{a3}, {b3}] °C. In Transilvania si in Maramures, mediile au variat "
+        "intre [{a4}, {b4}] °C. In zona montana inalta temperaturile au fost "
+        "cuprinse intre [{a5}, {b5}] °C, iar pe creste sub [{a6}, {b6}] °C."
+    )
+
+    def __init__(self, model: str, **_kwargs):
+        self.model = model
+        self.last_meta: Dict = {}
+
+    def chat(self, system_prompt: str, user_prompt: str) -> str:
+        # Derive the canned intervals from a stable hash of the prompts
+        # so dry-runs are reproducible. The bins are always 2 °C wide
+        # to honour the system prompt's spec.
+        import hashlib
+        h = hashlib.sha256((self.model + user_prompt).encode("utf-8")).hexdigest()
+        seed = int(h[:8], 16)
+        # Six bins covering roughly the plausible temperature range.
+        base = (seed % 30) - 10                              # -10..+19
+        bins = [base + 2 * i for i in range(6)]
+        ranges = [(b, b + 2) for b in bins]
+        self.last_meta = {
+            "provider": "mock",
+            "model": self.model,
+            "num_ctx": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "done_reason": "stop",
+        }
+        return self._CANNED_TEMPLATE.format(
+            a1=ranges[0][0], b1=ranges[0][1],
+            a2=ranges[1][0], b2=ranges[1][1],
+            a3=ranges[2][0], b3=ranges[2][1],
+            a4=ranges[3][0], b4=ranges[3][1],
+            a5=ranges[4][0], b5=ranges[4][1],
+            a6=ranges[5][0], b6=ranges[5][1],
+        )
+
+
+_OPENAI_JUDGE_DEFAULT_MODEL = "gpt-5-mini"
+_OPENAI_JUDGE_REASONING_EFFORT = "minimal"
+_OPENAI_JUDGE_MAX_OUTPUT_TOKENS = 2048
+
+
+def _resolve_openai_api_key(provided: Optional[str]) -> str:
+    """
+    Resolve an OpenAI API key from an explicit argument or the
+    OPENAI_API_KEY environment variable. Raises with a clear message
+    otherwise. NEVER read or write the key from/to code or config
+    files - environment-only is the only supported path.
+    """
+    if provided:
+        return provided
+    env = os.environ.get("OPENAI_API_KEY")
+    if env:
+        return env
+    raise RuntimeError(
+        "OpenAI API key not provided. Set the OPENAI_API_KEY environment "
+        "variable (PowerShell: setx OPENAI_API_KEY \"sk-...\" then reopen "
+        "the terminal) or pass --judge_provider ollama to use a local "
+        "Ollama model as judge instead."
+    )
+
+
+class OpenAIJudgeClient:
+    """
+    Judge-side client that exposes the same .chat(system, user) -> str
+    interface as OllamaClient, but routes to the OpenAI Responses API
+    (default model: gpt-5-mini). The key is read from OPENAI_API_KEY -
+    never hard-coded.
+    """
+
+    def __init__(
+        self,
+        model: str = _OPENAI_JUDGE_DEFAULT_MODEL,
+        api_key: Optional[str] = None,
+        reasoning_effort: str = _OPENAI_JUDGE_REASONING_EFFORT,
+        max_output_tokens: int = _OPENAI_JUDGE_MAX_OUTPUT_TOKENS,
+    ):
+        from openai import OpenAI  # local import: only needed when judge is OpenAI
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.max_output_tokens = max_output_tokens
+        self.last_meta: Dict = {}
+        self._client = OpenAI(api_key=_resolve_openai_api_key(api_key))
+
+    def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.last_meta = {}
+        try:
+            response = self._client.responses.create(
+                model=self.model,
+                reasoning={"effort": self.reasoning_effort},
+                instructions=system_prompt,
+                input=user_prompt,
+                max_output_tokens=self.max_output_tokens,
+            )
+            usage = getattr(response, "usage", None)
+            incomplete = getattr(response, "incomplete_details", None)
+            self.last_meta = {
+                "provider": "openai",
+                "model": self.model,
+                "num_ctx": self.max_output_tokens,
+                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+                "status": getattr(response, "status", None),
+                "incomplete_reason": getattr(incomplete, "reason", None) if incomplete else None,
+                "done_reason": (
+                    "length"
+                    if getattr(incomplete, "reason", None) == "max_output_tokens"
+                    else "stop"
+                ),
+            }
+            return response.output_text or ""
+        except Exception as e:
+            self.last_meta = {
+                "provider": "openai",
+                "model": self.model,
+                "error": f"{type(e).__name__}: {e}",
+            }
+            return f"Error: {e}"
+
+
+def llm_judge_score(
+    *,
+    gt_paragraph: str,
+    predicted_paragraph: str,
+    llm_call,
+) -> Dict:
+    """
+    LLM-as-judge scoring. `llm_call` is a callable
+    `(system_prompt, user_prompt) -> reply_text` so this function is
+    decoupled from any specific Ollama / OpenAI client.
+
+    Returns:
+        {
+          'judge_accuracy': float in [0, 1] | None,
+          'judge_score_int': int in [0, 100] | None,
+          'judge_raw_reply': str,
+        }
+    """
+    system_p, user_p = build_judge_prompt(gt_paragraph, predicted_paragraph)
+    reply = llm_call(system_p, user_p)
+    score_int = parse_judge_score(reply or "")
+    accuracy = score_int / 100.0 if score_int is not None else None
+    return {
+        "judge_accuracy": accuracy,
+        "judge_score_int": score_int,
+        "judge_raw_reply": reply,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test runner
+# ---------------------------------------------------------------------------
+#
+# Iterates model x scenario x fold x mode for ONE model at a time, per
+# the spec "iterating through the llms (so all tests for a single llm
+# and move on the the next model)". Persists the running results to a
+# per-model JSON file after each individual evaluation, so a crash or
+# Ctrl-C mid-pass loses at most one prediction.
+#
+# Fold schedules:
+#   monthly: fold_n in {3, 6, 9}, target_month derived as
+#            target_month = fold_n + 1 (predict the month right after
+#            the known span; the spec calls for 'predict the next
+#            month only')
+#   daily:   n_known_days in {6, 12, 18, 24}, target_month is
+#            user-configurable (default 4 = April)
+
+MONTHLY_FOLDS = (3, 6, 9)
+DAILY_FOLDS = (6, 12, 18, 24)
+
+
+# Fraction of num_ctx above which we flag an input prompt as
+# "near-context-limit" - Ollama silently drops the front of the
+# message list when the input exceeds num_ctx, so a fill close to
+# 1.0 means content may already be missing from what the model sees.
+_NEAR_LIMIT_FRACTION = 0.95
+
+
+def _extract_truncation_flags(meta: Dict, role: str) -> Dict:
+    """
+    Turn a client's last_meta into a normalised flags dict. `role` is
+    'predictor' or 'judge'. Detects two failure modes:
+
+      * output_truncated: generation stopped because it hit a length
+        limit (Ollama done_reason == 'length' / OpenAI status
+        'incomplete' with reason 'max_output_tokens').
+      * input_near_limit: prompt_eval_count >= num_ctx * 0.95 - Ollama
+        does not raise on input overflow; it silently drops the front
+        of the messages array, so a near-full input is the only signal
+        we get that content may have been lost.
+    """
+    flags = {
+        "role": role,
+        "provider": meta.get("provider"),
+        "model": meta.get("model"),
+        "input_tokens": meta.get("input_tokens"),
+        "output_tokens": meta.get("output_tokens"),
+        "done_reason": meta.get("done_reason"),
+        "status": meta.get("status"),
+        "incomplete_reason": meta.get("incomplete_reason"),
+        "output_truncated": False,
+        "input_near_limit": False,
+        "input_fill_ratio": None,
+    }
+    if meta.get("done_reason") == "length":
+        flags["output_truncated"] = True
+    if meta.get("incomplete_reason") == "max_output_tokens":
+        flags["output_truncated"] = True
+    num_ctx = meta.get("num_ctx")
+    in_tok = meta.get("input_tokens")
+    if num_ctx and in_tok is not None and meta.get("provider") == "ollama":
+        ratio = in_tok / float(num_ctx)
+        flags["input_fill_ratio"] = round(ratio, 3)
+        if ratio >= _NEAR_LIMIT_FRACTION:
+            flags["input_near_limit"] = True
+    return flags
+
+
+def _flag_is_problem(flag: Dict) -> bool:
+    return bool(flag.get("output_truncated") or flag.get("input_near_limit"))
+
+
+def _log_token_limit_event(
+    log_path: Path,
+    eval_idx: int,
+    total: int,
+    scenario: str,
+    fold_n: int,
+    mode: str,
+    target_month: int,
+    pred_flags: Dict,
+    judge_flags: Dict,
+) -> None:
+    """
+    Append a single human-readable line per problematic evaluation to
+    {output_dir}/logs/token_limits_{model}.log. Only writes when at
+    least one of pred/judge actually tripped a limit, so the log stays
+    short and grep-able.
+    """
+    if not (_flag_is_problem(pred_flags) or _flag_is_problem(judge_flags)):
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    import datetime as _dt
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    parts = [
+        stamp,
+        f"[{eval_idx}/{total}]",
+        f"scenario={scenario}",
+        f"fold_n={fold_n}",
+        f"mode={mode}",
+        f"target_month={target_month:02d}",
+    ]
+    for role, flag in (("PREDICTOR", pred_flags), ("JUDGE", judge_flags)):
+        issues = []
+        if flag.get("output_truncated"):
+            issues.append(
+                f"output_truncated(done_reason={flag.get('done_reason')!r}, "
+                f"incomplete_reason={flag.get('incomplete_reason')!r}, "
+                f"out_tokens={flag.get('output_tokens')})"
+            )
+        if flag.get("input_near_limit"):
+            issues.append(
+                f"input_near_limit(in_tokens={flag.get('input_tokens')}/"
+                f"{flag.get('input_tokens') and round(flag.get('input_tokens') / max(flag.get('input_fill_ratio'), 1e-9))}, "
+                f"fill_ratio={flag.get('input_fill_ratio')})"
+            )
+        if issues:
+            parts.append(f"{role}({flag.get('provider')}/{flag.get('model')}): "
+                         + "; ".join(issues))
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(" | ".join(parts) + "\n")
+
+
+def _monthly_target_month(fold_n: int) -> int:
+    """fold_n=3 -> April; fold_n=6 -> July; fold_n=9 -> October."""
+    return fold_n + 1
+
+
+def _model_id_for_filename(model_name: str) -> str:
+    """'llama3.1:70b-instruct-q4_K_S' -> 'llama3.1_70b-instruct-q4_K_S'."""
+    return model_name.replace(":", "_").replace("/", "_")
+
+
+def run_llm_tests(
+    *,
+    model_name: str,
+    client,
+    judge_client,
+    metadata: dict,
+    historic_data_path: str | Path,
+    output_dir: str | Path = "llm_runs",
+    year: int = 2024,
+    daily_test_month: int = 4,
+    aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+    modes: Sequence[str] = MODES,
+    date_folder: str = "date",
+    on_progress=None,
+) -> Dict:
+    """
+    Run the full (5 modes x [3 monthly folds + 4 daily folds]) test
+    matrix for ONE model. Writes the running results to
+    {output_dir}/llm_runs_{model_id}.json incrementally.
+
+    Args:
+        model_name:     human-readable model identifier, e.g.
+                        'gpt-oss:latest'. Used in JSON metadata + the
+                        output filename.
+        client:         OllamaClient or MockOllamaClient. Must expose
+                        .chat(system_prompt, user_prompt) -> str.
+        judge_client:   same shape; can be the same instance as client
+                        or a different one (e.g. a stronger judge model
+                        to mitigate same-model bias).
+        metadata:       stations_metadata.json contents.
+        historic_data_path: path to historic_data_yyyy.json.
+        output_dir:     directory for per-model JSON outputs.
+        year:           data year (2024).
+        daily_test_month: month to use for the daily scenario (default
+                        April = month 4).
+        aux_matrices:   dict of pd.DataFrame keyed by 'temp', 'precip',
+                        'wind', 'nebulosity'. Required for any mode
+                        that uses temperature or aux data.
+        modes:          which modes to run; defaults to all five.
+        on_progress:    optional callback (event_dict) for live UI.
+
+    Returns:
+        Same dict that gets written to disk.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"llm_runs_{_model_id_for_filename(model_name)}.json"
+    log_path = out_dir / "logs" / f"token_limits_{_model_id_for_filename(model_name)}.log"
+
+    is_dry_run = isinstance(client, MockOllamaClient)
+    print(f"\n{'=' * 60}")
+    print(f"LLM test run: model={model_name} (dry_run={is_dry_run})")
+    print(f"Output: {out_path}")
+    print(f"{'=' * 60}")
+
+    run_metadata = {
+        "model": model_name,
+        "dry_run": is_dry_run,
+        "year": year,
+        "daily_test_month": daily_test_month,
+        "monthly_folds": list(MONTHLY_FOLDS),
+        "daily_folds": list(DAILY_FOLDS),
+        "modes": list(modes),
+        "num_ctx": getattr(client, "num_ctx", None),
+    }
+    results: List[Dict] = []
+
+    def _persist():
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"metadata": run_metadata, "results": results},
+                f, ensure_ascii=False, indent=2,
+            )
+
+    total = (len(MONTHLY_FOLDS) + len(DAILY_FOLDS)) * len(modes)
+    done = 0
+    for scenario, folds in (("monthly", MONTHLY_FOLDS), ("daily", DAILY_FOLDS)):
+        for fold_n in folds:
+            if scenario == "monthly":
+                target_month = _monthly_target_month(fold_n)
+            else:
+                target_month = daily_test_month
+            for mode in modes:
+                done += 1
+                print(f"\n[{done}/{total}] {scenario} fold={fold_n} target={target_month:02d} "
+                      f"mode={mode}")
+                try:
+                    sys_p, usr_p, zones, gt_para = build_prompt_pair(
+                        scenario=scenario, fold_n=fold_n, mode=mode,
+                        target_month=target_month, year=year,
+                        historic_data_path=historic_data_path,
+                        metadata=metadata, aux_matrices=aux_matrices,
+                        date_folder=date_folder,
+                    )
+                    pred_raw = client.chat(sys_p, usr_p)
+                    pred_flags = _extract_truncation_flags(
+                        getattr(client, "last_meta", {}) or {}, role="predictor"
+                    )
+                    pred_fluent = postprocess_brackets_to_fluent_romanian(pred_raw)
+
+                    manual = manual_score(
+                        predicted_paragraph=pred_raw,
+                        gt_paragraph=gt_para,
+                        target_month=target_month, year=year,
+                        metadata=metadata, date_folder=date_folder,
+                    )
+                    judge = llm_judge_score(
+                        gt_paragraph=gt_para,
+                        predicted_paragraph=pred_raw,
+                        llm_call=judge_client.chat,
+                    )
+                    judge_flags = _extract_truncation_flags(
+                        getattr(judge_client, "last_meta", {}) or {}, role="judge"
+                    )
+                    _log_token_limit_event(
+                        log_path, done, total, scenario, fold_n, mode,
+                        target_month, pred_flags, judge_flags,
+                    )
+                    print(f"    manual accuracy={manual['accuracy']:.3f}  "
+                          f"judge accuracy="
+                          f"{('%.3f' % judge['judge_accuracy']) if judge['judge_accuracy'] is not None else 'None'}")
+                    if _flag_is_problem(pred_flags) or _flag_is_problem(judge_flags):
+                        print(f"    WARNING: token-limit event logged to {log_path}")
+                    rec = {
+                        "scenario": scenario,
+                        "fold_n": fold_n,
+                        "mode": mode,
+                        "target_month": target_month,
+                        "year": year,
+                        "n_zones": len(zones),
+                        "zones": [
+                            {"axis": z["axis"], "key": z["key"],
+                             "cardinal": z["cardinal"],
+                             "n_stations": len(z["stations"])}
+                            for z in zones
+                        ],
+                        "gt_paragraph": gt_para,
+                        "predicted_paragraph_raw": pred_raw,
+                        "predicted_paragraph_fluent": pred_fluent,
+                        "manual_score": {
+                            "accuracy": manual["accuracy"],
+                            "d_bar": manual["d_bar"],
+                            "w": manual["w"],
+                            "counts": manual["counts"],
+                        },
+                        "judge_score": judge,
+                        "input_prompt_chars": len(usr_p) + len(sys_p),
+                        "output_chars": len(pred_raw),
+                        "truncation_flags": {
+                            "predictor": pred_flags,
+                            "judge": judge_flags,
+                        },
+                    }
+                    results.append(rec)
+                    if on_progress:
+                        on_progress(rec)
+                    _persist()
+                except Exception as e:
+                    err_rec = {
+                        "scenario": scenario, "fold_n": fold_n, "mode": mode,
+                        "target_month": target_month, "year": year,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                    print(f"    ERROR: {err_rec['error']}")
+                    results.append(err_rec)
+                    _persist()
+
+    print(f"\nDone. {len(results)} evaluations written to {out_path}")
+    return {"metadata": run_metadata, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Baseline -> LLM-format bridge
+# ---------------------------------------------------------------------------
+#
+# Re-uses the existing AR rollout machinery in baselines.py to produce
+# per-county temperature predictions for the daily test month, then:
+#
+#   1. Aggregates per-zone (mean over the zone's counties x all days
+#      of the month), bins into a 2 degC interval [a, b] anchored at
+#      floor(mean / 2) * 2 so the structure matches what the LLM is
+#      asked to emit.
+#   2. Builds a synthetic Romanian paragraph in the same [x, y] format
+#      so manual_score and the OpenAI judge can score it without any
+#      code changes - the resulting JSON file plugs straight into the
+#      existing comparison plotter.
+#
+# The baselines retrain at W = H = 6 corresponds to the daily scenario
+# only. There is no monthly equivalent (the baselines operate at daily
+# granularity), so this writer only emits daily-scenario rows.
+
+# Maps the baseline retrain --label values to the LLM input modes
+# they correspond to. Lines with the same colour in the comparison
+# plot will then represent the same input regime regardless of whether
+# the row came from an LLM or a baseline.
+_BASELINE_LABEL_TO_MODE: Dict[str, str] = {
+    "wh6_target": "temp_only",
+    "wh6_aux":    "historic_plus_aux",
+}
+
+
+def _bin_2c_floor(mean_value: float, bin_width: float = 2.0) -> Tuple[float, float]:
+    """Bin a real value into the 2 degC interval [a, a + w] anchored at
+    a = w * floor(mean / w). Returns plain floats so the synthesised
+    paragraph parses without scientific notation."""
+    a = bin_width * math.floor(mean_value / bin_width)
+    return (float(a), float(a + bin_width))
+
+
+def predict_baseline_full_month(
+    *,
+    ckpt_path: Path,
+    target_month: int,
+    year: int,
+    n_known_days: int,
+    date_folder: str,
+    device: str,
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Run a one-shot AR rollout from `ckpt_path`. The input window is the
+    last W days of the K known days at the start of the target month;
+    the rollout fills in the remaining days_in_month - K days. The
+    return is a (days_in_month, n_counties) DataFrame indexed by date,
+    with the known days copied straight from the daily mean CSV and
+    the unknown days filled by the AR predictions, so downstream code
+    can aggregate per-zone over the entire month uniformly.
+    """
+    import torch                                                     # noqa
+    from prompting.utils.baselines import (
+        load_county_matrix, load_fold_checkpoint, autoregressive_rollout,
+    )
+
+    payload_peek = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    W = payload_peek["model_init_kwargs"]["window"]
+    H = payload_peek["model_init_kwargs"]["horizon"]
+    n_in = payload_peek["model_init_kwargs"]["n_input_channels"]
+    n_out = payload_peek["model_init_kwargs"]["n_output_channels"]
+    baseline_name = payload_peek["baseline"]
+    label = payload_peek.get("label", "")
+    extra_csv_filenames = payload_peek.get("extra_csv_filenames")
+
+    input_matrix, target_matrix, dates, counties, _ = load_county_matrix(
+        date_folder, "daily_county_mean.csv",
+        extra_csv_filenames=extra_csv_filenames,
+    )
+
+    first_day = pd.Timestamp(year=year, month=target_month, day=1)
+    n_days = (first_day + pd.offsets.MonthEnd(0)).day
+    try:
+        first_idx = dates.get_loc(first_day)
+    except KeyError as e:
+        raise ValueError(
+            f"first day of {year}-{target_month:02d} not in matrix: {e}"
+        )
+
+    if n_known_days < W:
+        raise ValueError(
+            f"n_known_days={n_known_days} < W={W} - cannot build input window"
+        )
+    if n_known_days > n_days:
+        raise ValueError(
+            f"n_known_days={n_known_days} > days_in_month={n_days}"
+        )
+    days_to_predict = n_days - n_known_days
+    window_start_idx = first_idx + (n_known_days - W)
+
+    if window_start_idx + W + days_to_predict > len(dates):
+        raise ValueError(
+            f"matrix ends at {dates[-1].date()}; need data through "
+            f"{(first_day + pd.Timedelta(days=n_days - 1)).date()}"
+        )
+
+    init_window = input_matrix[window_start_idx:window_start_idx + W]
+    aux_truth = None
+    if n_in > n_out and days_to_predict > 0:
+        aux_truth = input_matrix[
+            window_start_idx + W:window_start_idx + W + days_to_predict,
+            n_out:,
+        ]
+
+    model, scaler, _payload = load_fold_checkpoint(ckpt_path)
+    model = model.to(device).eval()
+
+    if days_to_predict > 0:
+        ar_pred = autoregressive_rollout(
+            model, scaler, init_window, total_steps=days_to_predict, H=H,
+            n_input_channels=n_in, n_output_channels=n_out,
+            device=device, aux_truth=aux_truth,
+        )
+    else:
+        ar_pred = np.empty((0, n_out), dtype=np.float32)
+
+    known_days = target_matrix[first_idx:first_idx + n_known_days]
+    full_month = np.concatenate([known_days, ar_pred], axis=0)
+    pred_df = pd.DataFrame(
+        full_month,
+        index=pd.date_range(first_day, periods=n_days, freq="D"),
+        columns=counties,
+    )
+    meta = {
+        "baseline": baseline_name,
+        "label": label,
+        "W": W, "H": H,
+        "n_input_channels": n_in,
+        "n_output_channels": n_out,
+        "days_known": n_known_days,
+        "days_predicted": days_to_predict,
+        "extra_csv_filenames": extra_csv_filenames,
+    }
+    return pred_df, meta
+
+
+def baseline_paragraph_from_predictions(
+    *,
+    predictions: pd.DataFrame,
+    zones: List[Dict],
+    metadata: dict,
+) -> str:
+    """
+    For each zone in `zones`, compute the predicted MONTHLY mean over
+    the zone's counties across every day of `predictions`, snap to the
+    nearest 2 degC bin, and emit one Romanian sentence in the
+    `intre [a, b] degC` format the manual scorer parses. Zones with
+    no matching county column are skipped (no false 'missed' penalty).
+    """
+    set_metadata_for_aggregators(metadata)
+    sentences: List[str] = []
+    for z in zones:
+        counties_for_zone = _zone_to_counties(z, metadata)
+        if not counties_for_zone:
+            continue
+        available = [c for c in counties_for_zone if c in predictions.columns]
+        if not available:
+            continue
+        block = predictions[available].to_numpy(dtype=float)
+        mask = np.isfinite(block)
+        if not mask.any():
+            continue
+        zone_mean = float(block[mask].mean())
+        a, b = _bin_2c_floor(zone_mean)
+        label = zone_label_romanian(z)
+        sentences.append(
+            f"In {label}, mediile lunare au fost cuprinse intre "
+            f"[{a}, {b}] °C."
+        )
+    return " ".join(sentences)
+
+
+def _zones_for_daily_scenario(
+    *,
+    paragraphs: Dict[str, str],
+    target_month: int,
+    metadata: dict,
+) -> List[Dict]:
+    """Mirror build_prompt_pair's daily-scenario zone selection: extract
+    + dedupe zones from every month before the target month. Same
+    vocabulary the LLM sees."""
+    all_zones: List[Dict] = []
+    for m in range(1, target_month):
+        para = paragraphs.get(romanian_month_name(m), "")
+        if para:
+            all_zones.extend(extract_zones_from_text(para, metadata))
+    return dedupe_zones(all_zones)
+
+
+def run_baseline_to_llm_format(
+    *,
+    baselines_dir: str = "baselines",
+    output_dir: str = "llm_runs",
+    fold: int = 4,
+    year: int = 2024,
+    daily_test_month: int = 4,
+    historic_data_path: str | Path = "date/historic_data_2024.json",
+    metadata: Optional[dict] = None,
+    date_folder: str = "date",
+    use_openai_judge: bool = False,
+    judge_model: str = _OPENAI_JUDGE_DEFAULT_MODEL,
+    device: str = "auto",
+) -> Dict[str, Path]:
+    """
+    Walk every fold-N checkpoint under {baselines_dir}/checkpoints/,
+    run a daily-scenario evaluation matching the LLM eval matrix at
+    K in {6, 12, 18, 24}, and write one
+    {output_dir}/llm_runs_baseline_{baseline}_{label}.json per
+    checkpoint in the SAME schema as the LLM runner. The existing
+    aggregator/plotter then treats baselines as additional 'models'
+    in the comparison without any further code changes.
+    """
+    if metadata is None:
+        metadata = load_stations_metadata(Path(date_folder) / "stations_metadata.json")
+    set_metadata_for_aggregators(metadata)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = Path(baselines_dir) / "checkpoints"
+    if not ckpt_dir.is_dir():
+        raise FileNotFoundError(
+            f"no checkpoints/ under {baselines_dir} - retrain with --save_weights"
+        )
+    ckpts = sorted(ckpt_dir.glob(f"*_fold{fold}.pt"))
+    if not ckpts:
+        raise FileNotFoundError(
+            f"no fold-{fold} checkpoints under {ckpt_dir}"
+        )
+
+    if device == "auto":
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+    with open(historic_data_path, "r", encoding="utf-8") as f:
+        historic = json.load(f)
+    paragraphs: Dict[str, str] = historic["caracterizare_lunara"]
+    gt_paragraph = paragraphs.get(romanian_month_name(daily_test_month), "")
+    zones = _zones_for_daily_scenario(
+        paragraphs=paragraphs, target_month=daily_test_month, metadata=metadata,
+    )
+    print(f"Baseline-as-LLM eval: fold={fold}, test_month={daily_test_month}, "
+          f"zones={len(zones)}, device={device}")
+
+    judge_client = OpenAIJudgeClient(model=judge_model) if use_openai_judge else None
+    if use_openai_judge:
+        print(f"Judge: OpenAI {judge_model} (key from OPENAI_API_KEY env var)")
+    else:
+        print("Judge: disabled (manual scoring only)")
+
+    written: Dict[str, Path] = {}
+    for ckpt_path in ckpts:
+        print(f"\n  checkpoint: {ckpt_path.name}")
+        run_meta: Dict = {}
+        results: List[Dict] = []
+        model_id: Optional[str] = None
+        out_path: Optional[Path] = None
+
+        for K in DAILY_FOLDS:
+            try:
+                pred_df, ck_meta = predict_baseline_full_month(
+                    ckpt_path=ckpt_path,
+                    target_month=daily_test_month, year=year,
+                    n_known_days=K, date_folder=date_folder, device=device,
+                )
+                if model_id is None:
+                    label = ck_meta["label"] or "unlabelled"
+                    model_id = f"baseline:{ck_meta['baseline']}_{label}"
+                    out_path = out_dir / (
+                        f"llm_runs_{_model_id_for_filename(model_id)}.json"
+                    )
+                    run_meta = {
+                        "model": model_id,
+                        "kind": "baseline",
+                        "year": year,
+                        "daily_test_month": daily_test_month,
+                        "fold": fold,
+                        "checkpoint": str(ckpt_path),
+                        "W": ck_meta["W"], "H": ck_meta["H"],
+                        "n_input_channels": ck_meta["n_input_channels"],
+                        "n_output_channels": ck_meta["n_output_channels"],
+                        "extra_csv_filenames": ck_meta["extra_csv_filenames"],
+                    }
+                pred_paragraph = baseline_paragraph_from_predictions(
+                    predictions=pred_df, zones=zones, metadata=metadata,
+                )
+                pred_fluent = postprocess_brackets_to_fluent_romanian(pred_paragraph)
+                manual = manual_score(
+                    predicted_paragraph=pred_paragraph,
+                    gt_paragraph=gt_paragraph,
+                    target_month=daily_test_month, year=year,
+                    metadata=metadata, date_folder=date_folder,
+                )
+                if judge_client is not None:
+                    judge = llm_judge_score(
+                        gt_paragraph=gt_paragraph,
+                        predicted_paragraph=pred_paragraph,
+                        llm_call=judge_client.chat,
+                    )
+                else:
+                    judge = {
+                        "judge_accuracy": None,
+                        "judge_score_int": None,
+                        "judge_raw_reply": None,
+                    }
+                mode = _BASELINE_LABEL_TO_MODE.get(
+                    ck_meta["label"], "temp_only"
+                )
+                rec = {
+                    "scenario": "daily",
+                    "fold_n": K,
+                    "mode": mode,
+                    "target_month": daily_test_month,
+                    "year": year,
+                    "n_zones": len(zones),
+                    "zones": [
+                        {"axis": z["axis"], "key": z["key"],
+                         "cardinal": z["cardinal"],
+                         "n_stations": len(z["stations"])}
+                        for z in zones
+                    ],
+                    "gt_paragraph": gt_paragraph,
+                    "predicted_paragraph_raw": pred_paragraph,
+                    "predicted_paragraph_fluent": pred_fluent,
+                    "manual_score": {
+                        "accuracy": manual["accuracy"],
+                        "d_bar": manual["d_bar"],
+                        "w": manual["w"],
+                        "counts": manual["counts"],
+                    },
+                    "judge_score": judge,
+                    "input_prompt_chars": 0,
+                    "output_chars": len(pred_paragraph),
+                    "checkpoint_meta": ck_meta,
+                }
+                print(f"    K={K:>2d}: manual={manual['accuracy']:.3f}  "
+                      f"judge="
+                      f"{('%.3f' % judge['judge_accuracy']) if judge['judge_accuracy'] is not None else 'None'}")
+                results.append(rec)
+            except Exception as e:
+                print(f"    K={K}: ERROR {type(e).__name__}: {e}")
+                results.append({
+                    "scenario": "daily", "fold_n": K, "mode": "temp_only",
+                    "target_month": daily_test_month, "year": year,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+
+        if out_path is not None:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"metadata": run_meta, "results": results},
+                    f, ensure_ascii=False, indent=2,
+                )
+            print(f"    -> {out_path}")
+            written[model_id] = out_path
+
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Comparison plotter
+# ---------------------------------------------------------------------------
+#
+# Aggregates everything that the runner produced and turns it into:
+#
+#   1. Per-(scenario, mode) accuracy lines across folds, one line per
+#      (model, mode), separate figure per scenario. This is the
+#      headline "more known data -> better accuracy" view.
+#
+#   2. Manual-vs-judge scatter per model. y=x reference + Spearman
+#      correlation in the title - so you can see whether the judge is
+#      biased relative to the manual algorithm, and in which direction.
+#
+#   3. Per-model summary CSV: one row per (model, scenario, fold, mode)
+#      with manual_accuracy and judge_accuracy, ready for any
+#      downstream analysis.
+
+
+def aggregate_llm_runs(
+    llm_runs_dir: str | Path = "llm_runs",
+) -> "pd.DataFrame":
+    """
+    Load every llm_runs_<model>.json under `llm_runs_dir` and flatten
+    the rows into one DataFrame with columns:
+      [model, scenario, fold_n, mode, target_month, n_zones,
+       manual_accuracy, manual_d_bar, manual_intersection, manual_missed,
+       manual_false_pos, manual_unscorable,
+       judge_accuracy, judge_score_int,
+       input_prompt_chars, output_chars]
+
+    Rows that ended in an error during the run are kept but have
+    NaN scores so they're visible in any tally.
+    """
+    out_dir = Path(llm_runs_dir)
+    if not out_dir.is_dir():
+        raise FileNotFoundError(f"llm_runs directory not found: {out_dir}")
+
+    rows: List[Dict] = []
+    for path in sorted(out_dir.glob("llm_runs_*.json")):
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        meta = blob.get("metadata", {}) or {}
+        model = meta.get("model", path.stem)
+        kind = meta.get("kind", "llm")
+        for r in blob.get("results", []):
+            ms = r.get("manual_score") or {}
+            js = r.get("judge_score") or {}
+            counts = ms.get("counts") or {}
+            rows.append({
+                "model": model,
+                "kind": kind,
+                "scenario": r.get("scenario"),
+                "fold_n": r.get("fold_n"),
+                "mode": r.get("mode"),
+                "target_month": r.get("target_month"),
+                "n_zones": r.get("n_zones"),
+                "manual_accuracy": ms.get("accuracy"),
+                "manual_d_bar": ms.get("d_bar"),
+                "manual_intersection": counts.get("intersection"),
+                "manual_missed": counts.get("missed"),
+                "manual_false_pos": counts.get("false_pos"),
+                "manual_unscorable": counts.get("unscorable"),
+                "judge_accuracy": js.get("judge_accuracy"),
+                "judge_score_int": js.get("judge_score_int"),
+                "input_prompt_chars": r.get("input_prompt_chars"),
+                "output_chars": r.get("output_chars"),
+                "had_error": "error" in r,
+                "error": r.get("error"),
+            })
+    return pd.DataFrame(rows)
+
+
+# Ordered mode list for consistent colour assignment across plots.
+_MODE_ORDER = list(MODES)
+
+
+def plot_llm_accuracy_curves(
+    df: "pd.DataFrame",
+    output_dir: str | Path,
+    show: bool = False,
+) -> List[str]:
+    """
+    Per-scenario figure: x = fold_n, y = manual_accuracy.
+    One subplot per scenario; one line per (model, mode). Lines colour-
+    coded by mode; one solid colour per mode (same hue across models).
+    Models distinguished by linestyle (solid for the first, dashed for
+    the second, etc.). With one model (the dry-run case) only solid
+    lines appear.
+
+    Writes one PNG per metric (manual + judge) per scenario, so 4 PNGs
+    total when both scenarios have data and both scorers were called.
+    """
+    import matplotlib.pyplot as plt
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    if df.empty:
+        print("aggregate_llm_runs returned empty df; nothing to plot.")
+        return written
+
+    cmap = plt.get_cmap("tab10")
+    mode_color = {m: cmap(i) for i, m in enumerate(_MODE_ORDER)}
+    models = sorted(df["model"].dropna().unique().tolist())
+    model_style = {m: ls for m, ls in
+                   zip(models, ["-", "--", ":", "-."])}
+
+    for metric_key, metric_label in [
+        ("manual_accuracy", "manual accuracy"),
+        ("judge_accuracy", "judge accuracy"),
+    ]:
+        for scenario in sorted(df["scenario"].dropna().unique().tolist()):
+            sub = df[(df["scenario"] == scenario) & df[metric_key].notna()]
+            if sub.empty:
+                continue
+            fig, ax = plt.subplots(figsize=(8, 5.5))
+            folds_sorted = sorted(sub["fold_n"].dropna().unique().tolist())
+
+            for model in models:
+                for mode in _MODE_ORDER:
+                    line = sub[(sub["model"] == model) & (sub["mode"] == mode)]
+                    if line.empty:
+                        continue
+                    line = line.sort_values("fold_n")
+                    ax.plot(
+                        line["fold_n"].astype(float).tolist(),
+                        line[metric_key].astype(float).tolist(),
+                        color=mode_color[mode],
+                        linestyle=model_style.get(model, "-"),
+                        marker="o", markersize=5, linewidth=2,
+                        label=f"{model} | {mode}",
+                    )
+
+            fold_unit = "known months" if scenario == "monthly" else "known days"
+            ax.set_xlabel(f"fold_n ({fold_unit})")
+            ax.set_ylabel(metric_label)
+            ax.set_xticks(folds_sorted)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(
+                f"LLM {metric_label} vs known-data quantity\n"
+                f"scenario = {scenario}"
+            )
+            # Compact legend: one entry per unique (model, mode) — keep
+            # outside the plot since 5+ entries get crowded.
+            ax.legend(
+                fontsize=8, loc="center left",
+                bbox_to_anchor=(1.02, 0.5), frameon=False,
+            )
+            fig.tight_layout()
+            out_path = out_dir / f"llm_{metric_key}_{scenario}.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            written.append(str(out_path))
+            print(f"Wrote {out_path}")
+            if not show:
+                plt.close(fig)
+    return written
+
+
+def plot_manual_vs_judge(
+    df: "pd.DataFrame",
+    output_dir: str | Path,
+    show: bool = False,
+) -> List[str]:
+    """
+    Per-model scatter: x = manual_accuracy, y = judge_accuracy. y=x
+    reference line + Spearman correlation in the title. One figure per
+    model.
+
+    A judge that strongly correlates with the manual algorithm and
+    sits near y=x is unbiased. Systematic deviation (most points
+    above the diagonal -> judge over-scores; below -> judge under-
+    scores) is what we want to detect.
+    """
+    import matplotlib.pyplot as plt
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    if df.empty:
+        return written
+
+    cmap = plt.get_cmap("tab10")
+    mode_color = {m: cmap(i) for i, m in enumerate(_MODE_ORDER)}
+
+    for model in sorted(df["model"].dropna().unique().tolist()):
+        sub = df[(df["model"] == model)
+                 & df["manual_accuracy"].notna()
+                 & df["judge_accuracy"].notna()]
+        if sub.empty:
+            continue
+
+        fig, ax = plt.subplots(figsize=(6.5, 6))
+        for mode in _MODE_ORDER:
+            mc = sub[sub["mode"] == mode]
+            if mc.empty:
+                continue
+            ax.scatter(
+                mc["manual_accuracy"], mc["judge_accuracy"],
+                color=mode_color[mode], label=mode, s=70,
+                edgecolor="black", linewidth=0.4, alpha=0.85,
+            )
+        # y = x reference
+        ax.plot([0, 1], [0, 1], color="black", linestyle=":", linewidth=1.0,
+                label="y = x (unbiased judge)")
+
+        # Spearman correlation (rank-based; robust to monotonic
+        # rescaling between the two scorers)
+        x = sub["manual_accuracy"].astype(float).values
+        y = sub["judge_accuracy"].astype(float).values
+        if len(x) >= 3:
+            x_rank = pd.Series(x).rank().values
+            y_rank = pd.Series(y).rank().values
+            corr = float(np.corrcoef(x_rank, y_rank)[0, 1])
+            corr_txt = f"Spearman corr = {corr:+.3f}"
+        else:
+            corr_txt = "(too few points for Spearman)"
+
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xlabel("manual accuracy")
+        ax.set_ylabel("judge accuracy")
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Manual vs judge agreement\n{model}\n{corr_txt}")
+        ax.legend(fontsize=8, loc="upper left", frameon=False)
+        fig.tight_layout()
+
+        out_path = out_dir / f"manual_vs_judge_{_model_id_for_filename(model)}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+    return written
+
+
+def write_summary_table(
+    df: "pd.DataFrame",
+    output_dir: str | Path,
+    filename: str = "summary.csv",
+) -> str:
+    """Persist the aggregated DataFrame as CSV next to the figures."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
+    df.to_csv(out_path, index=False, encoding="utf-8")
+    print(f"Wrote {out_path}  ({len(df)} rows, "
+          f"{df['model'].nunique()} model(s))")
+    return str(out_path)
+
+
+def plot_all(
+    llm_runs_dir: str | Path = "llm_runs",
+    output_dir: str | Path = "llm_runs/plots",
+    show: bool = False,
+) -> Dict:
+    """Convenience wrapper: aggregate + write all three artefacts."""
+    df = aggregate_llm_runs(llm_runs_dir)
+    if df.empty:
+        print(f"No llm_runs_*.json in {llm_runs_dir}; skipping plots.")
+        return {"rows": 0, "files": []}
+    csv_path = write_summary_table(df, output_dir)
+    pngs = plot_llm_accuracy_curves(df, output_dir, show=show)
+    pngs += plot_manual_vs_judge(df, output_dir, show=show)
+    if show:
+        import matplotlib.pyplot as plt
+        plt.show()
+    return {
+        "rows": len(df),
+        "files": [csv_path] + pngs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cli_main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python -m prompting.utils.llm_comparison",
+        description=(
+            "Run the LLM-vs-baseline comparison framework. The default "
+            "subcommand `run` runs the 5 modes x (3 monthly + 4 daily) "
+            "fold matrix for ONE model and writes a per-model JSON for "
+            "downstream comparison plotting."
+        ),
+    )
+    subs = p.add_subparsers(dest="subcommand", required=True)
+
+    run = subs.add_parser("run", help="Run the test matrix for one model")
+    run.add_argument("--model", type=str, required=True,
+                     help="Ollama model id, e.g. 'gpt-oss:latest', "
+                          "'llama3.1:70b-instruct-q4_K_S', 'llama3.1:8b-instruct-q4_K_M', "
+                          "'gemma3:27b-it-q4_K_M'")
+    run.add_argument("--judge_provider", type=str, default="openai",
+                     choices=["openai", "ollama"],
+                     help="Backend for the LLM-as-judge. Default 'openai' "
+                          "calls the Responses API with --judge_model "
+                          "(default gpt-5-mini); the key is read from the "
+                          "OPENAI_API_KEY env var (never from code). Use "
+                          "'ollama' to route the judge through a local "
+                          "Ollama model instead - useful for offline runs.")
+    run.add_argument("--judge_model", type=str, default=None,
+                     help="Model id for the judge. With --judge_provider "
+                          f"openai defaults to {_OPENAI_JUDGE_DEFAULT_MODEL!r}; "
+                          "with --judge_provider ollama defaults to --model "
+                          "so prediction and scoring share one Ollama client.")
+    run.add_argument("--dry_run", action="store_true",
+                     help="Use a mock client that returns canned "
+                          "Romanian paragraphs without any HTTP calls. "
+                          "Useful for verifying orchestration end-to-end "
+                          "before any real GPU time.")
+    run.add_argument("--ollama_base_url", type=str,
+                     default=_OLLAMA_DEFAULT_BASE_URL,
+                     help=f"Ollama server URL (default {_OLLAMA_DEFAULT_BASE_URL}).")
+    run.add_argument("--num_ctx", type=int, default=_OLLAMA_DEFAULT_NUM_CTX,
+                     help=f"Context window per call (default {_OLLAMA_DEFAULT_NUM_CTX}). "
+                          "The largest user prompt we produce is ~16K input tokens, "
+                          "so 32K gives a safe margin.")
+    run.add_argument("--temperature", type=float, default=_OLLAMA_DEFAULT_TEMPERATURE,
+                     help=f"Sampling temperature (default {_OLLAMA_DEFAULT_TEMPERATURE}, "
+                          "low so the [x, y] format constraint holds).")
+    run.add_argument("--keep_alive", type=str, default=_OLLAMA_DEFAULT_KEEP_ALIVE,
+                     help=f"Ollama keep_alive (default {_OLLAMA_DEFAULT_KEEP_ALIVE}). "
+                          "Keeps the model loaded in GPU between calls so the "
+                          "full pass doesn't pay reload cost on every iteration.")
+    run.add_argument("--date_folder", type=str, default="date",
+                     help="Folder holding stations_metadata.json, temperature_*.json, "
+                          "daily_county_*.csv, historic_data_*.json")
+    run.add_argument("--historic_data_filename", type=str,
+                     default="historic_data_2024.json")
+    run.add_argument("--year", type=int, default=2024)
+    run.add_argument("--daily_test_month", type=int, default=4,
+                     help="Month (1..12) to use for the daily scenario. "
+                          "Default 4 = April.")
+    run.add_argument("--output_dir", type=str, default="llm_runs",
+                     help="Directory for per-model JSON outputs.")
+    run.add_argument("--modes", type=str, nargs="*", default=None,
+                     help=f"Subset of modes to run. Defaults to all five: {list(MODES)}.")
+
+    plot = subs.add_parser(
+        "plot",
+        help="Aggregate llm_runs_*.json into CSV + comparison plots.",
+    )
+    plot.add_argument("--llm_runs_dir", type=str, default="llm_runs",
+                      help="Directory containing llm_runs_<model>.json files.")
+    plot.add_argument("--output_dir", type=str, default=None,
+                      help="Output directory for plots and summary.csv "
+                           "(defaults to <llm_runs_dir>/plots).")
+    plot.add_argument("--show", action="store_true",
+                      help="Also call plt.show() after writing files.")
+
+    baseline_eval = subs.add_parser(
+        "baseline_eval",
+        help="Evaluate trained baseline checkpoints as if they were LLMs, "
+             "writing one llm_runs_baseline_*.json per checkpoint that "
+             "plugs into the same comparison plotter.",
+    )
+    baseline_eval.add_argument("--baselines_dir", type=str, default="baselines",
+                               help="Directory holding checkpoints/ from the "
+                                    "W=H=6 retrain (default 'baselines').")
+    baseline_eval.add_argument("--output_dir", type=str, default="llm_runs",
+                               help="Where to write the per-baseline JSON "
+                                    "files. Default 'llm_runs' so the existing "
+                                    "plotter picks them up automatically.")
+    baseline_eval.add_argument("--fold", type=int, default=4,
+                               help="Which fold's checkpoint to evaluate "
+                                    "(default 4 - the deployable model).")
+    baseline_eval.add_argument("--year", type=int, default=2024)
+    baseline_eval.add_argument("--daily_test_month", type=int, default=4,
+                               help="Month (1..12) to evaluate. Must match "
+                                    "the daily_test_month used in the LLM "
+                                    "runs so the comparison is apples-to-"
+                                    "apples. Default 4 = April.")
+    baseline_eval.add_argument("--date_folder", type=str, default="date")
+    baseline_eval.add_argument("--historic_data_filename", type=str,
+                               default="historic_data_2024.json")
+    baseline_eval.add_argument("--use_openai_judge", action="store_true",
+                               help="Also score with the OpenAI gpt-5-mini "
+                                    "judge (mirrors the LLM eval). Disabled "
+                                    "by default since baseline outputs are "
+                                    "templated paragraphs and manual scoring "
+                                    "is sufficient for the comparison plot.")
+    baseline_eval.add_argument("--judge_model", type=str,
+                               default=_OPENAI_JUDGE_DEFAULT_MODEL)
+    baseline_eval.add_argument("--device", type=str, default="auto",
+                               choices=["auto", "cpu", "cuda"])
+
+    args = p.parse_args(argv)
+
+    if args.subcommand == "baseline_eval":
+        metadata = load_stations_metadata(
+            Path(args.date_folder) / "stations_metadata.json"
+        )
+        run_baseline_to_llm_format(
+            baselines_dir=args.baselines_dir,
+            output_dir=args.output_dir,
+            fold=args.fold,
+            year=args.year,
+            daily_test_month=args.daily_test_month,
+            historic_data_path=Path(args.date_folder) / args.historic_data_filename,
+            metadata=metadata,
+            date_folder=args.date_folder,
+            use_openai_judge=args.use_openai_judge,
+            judge_model=args.judge_model,
+            device=args.device,
+        )
+        return 0
+
+    if args.subcommand == "plot":
+        output_dir = args.output_dir or str(Path(args.llm_runs_dir) / "plots")
+        result = plot_all(
+            llm_runs_dir=args.llm_runs_dir,
+            output_dir=output_dir,
+            show=args.show,
+        )
+        print(f"Aggregated {result['rows']} rows across all llm_runs_*.json files.")
+        print("Wrote:")
+        for f in result["files"]:
+            print(f"  {f}")
+        return 0
+
+    if args.subcommand != "run":
+        p.print_help()
+        return 1
+
+    selected_modes = tuple(args.modes) if args.modes else MODES
+    for m in selected_modes:
+        if m not in MODES:
+            print(f"ERROR: unknown mode {m!r}; valid: {MODES}")
+            return 2
+
+    metadata = load_stations_metadata(
+        Path(args.date_folder) / "stations_metadata.json"
+    )
+    aux_matrices = {
+        "temp":       load_county_daily_matrix("daily_county_mean.csv", args.date_folder),
+        "precip":     load_county_daily_matrix("daily_county_precip.csv", args.date_folder),
+        "wind":       load_county_daily_matrix("daily_county_wind.csv", args.date_folder),
+        "nebulosity": load_county_daily_matrix("daily_county_nebulosity.csv", args.date_folder),
+    }
+    set_metadata_for_aggregators(metadata)
+
+    if args.dry_run:
+        client = MockOllamaClient(args.model)
+        judge = MockOllamaClient(args.judge_model or args.model)
+    else:
+        client = OllamaClient(
+            model=args.model, base_url=args.ollama_base_url,
+            num_ctx=args.num_ctx, temperature=args.temperature,
+            keep_alive=args.keep_alive,
+        )
+        if args.judge_provider == "openai":
+            judge_model = args.judge_model or _OPENAI_JUDGE_DEFAULT_MODEL
+            judge = OpenAIJudgeClient(model=judge_model)
+            print(f"Judge: OpenAI Responses API, model={judge_model} "
+                  "(key from OPENAI_API_KEY env var)")
+        else:
+            judge_model = args.judge_model or args.model
+            if judge_model == args.model:
+                judge = client
+            else:
+                judge = OllamaClient(
+                    model=judge_model, base_url=args.ollama_base_url,
+                    num_ctx=args.num_ctx, temperature=args.temperature,
+                    keep_alive=args.keep_alive,
+                )
+            print(f"Judge: Ollama, model={judge_model}")
+
+    run_llm_tests(
+        model_name=args.model,
+        client=client,
+        judge_client=judge,
+        metadata=metadata,
+        historic_data_path=Path(args.date_folder) / args.historic_data_filename,
+        output_dir=args.output_dir,
+        year=args.year,
+        daily_test_month=args.daily_test_month,
+        aux_matrices=aux_matrices,
+        modes=selected_modes,
+        date_folder=args.date_folder,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())
