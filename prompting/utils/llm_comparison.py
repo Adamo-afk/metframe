@@ -1883,31 +1883,26 @@ doua paragrafe in limba romana:
 
 Procedura ta:
 
-PASUL 1 - Extragere. Din fiecare paragraf identifica toate zonele
-mentionate impreuna cu intervalele lor de temperatura. Zonele pot fi:
-  - parti cardinale ale unei regiuni (ex: 'sud-estul Munteniei',
-    'nord-vestul Banatului'),
-  - regiuni intregi (ex: 'Muntenia', 'Transilvania', 'Moldova'),
-  - zone climatice (ex: 'litoral', 'Delta Dunarii', 'zona montana
-    inalta', 'Subcarpati', 'campie').
+PASUL 1 - Extragere REFERINTA. Identifica toate zonele mentionate
+impreuna cu intervalele lor de temperatura si scrie-le ca o lista
+de perechi [zona, [a, b]]. Zonele pot fi parti cardinale de regiuni
+(ex: "sud-estul Munteniei"), regiuni intregi (ex: "Muntenia") sau
+zone climatice (ex: "litoral", "Delta Dunarii", "zona montana
+inalta").
 
-PASUL 2 - Tabel comparativ. Listeaza zonele in paralel:
+PASUL 2 - Extragere PREDICTIE. Acelasi proces aplicat paragrafului
+generat de model. Rezultatul este o a doua lista de perechi
+[zona, [a, b]].
 
-  Zona | Interval REFERINTA | Interval PREDICTIE | Scor (0-100) | Motiv
+PASUL 3 - Motivatie. Scrie o singura propozitie scurta care explica
+diferentele dintre lista REFERINTA si lista PREDICTIE (zone lipsa
+sau in plus, distanta intre intervale).
 
-  Pune o linie pentru fiecare zona care apare in oricare paragraf.
-  Daca o zona apare in unul singur, marcheaza celalalt cu '-' si
-  trateaza ca scor 0.
-
-PASUL 3 - Scor per zona (intreg in [0, 100]). Cu cat este mai mare
-distanta, cu atat scorul este mai mic. Motiveaza alegerea
-procentajului intr-o singura propozitie scurta si concreta.
-
-PASUL 4 - Agregare. Calculeaza media aritmetica:
-  media = (sum scoruri per zona) / (numar zone)
-
-PASUL 5 - Rezultat. Pe ULTIMA linie, scrie media calculata ca un
-singur numar intreg intre paranteze drepte, exact in acest format:
+PASUL 4 - Rezultat. Pe baza celor doua liste si a motivatiei, alege
+un singur scor intreg de acuratete intre 0 si 100. Cu cat sunt mai
+apropiate intervalele si cu cat coincid mai mult zonele, cu atat
+scorul este mai mare. Pe ULTIMA linie, scrie scorul ca un singur
+numar intreg intre paranteze drepte, exact in formatul:
 
   [N]
 
@@ -1921,8 +1916,9 @@ JUDGE_USER_PROMPT_TEMPLATE = """REFERINTA:
 PREDICTIE:
 {pred}
 
-Raspunde urmand procedura din 5 pasi din mesajul de sistem. Ultima
-linie a raspunsului tau trebuie sa fie [N], unde N este media."""
+Raspunde urmand procedura din 4 pasi din mesajul de sistem. Ultima
+linie a raspunsului tau trebuie sa fie [N], unde N este scorul de
+acuratete."""
 
 
 def build_judge_prompt(gt_paragraph: str, predicted_paragraph: str) -> Tuple[str, str]:
@@ -2135,7 +2131,7 @@ class MockOllamaClient:
 
 _OPENAI_JUDGE_DEFAULT_MODEL = "gpt-5-mini"
 _OPENAI_JUDGE_REASONING_EFFORT = "minimal"
-_OPENAI_JUDGE_MAX_OUTPUT_TOKENS = 4096
+_OPENAI_JUDGE_MAX_OUTPUT_TOKENS = 2048
 
 
 def _resolve_openai_api_key(provided: Optional[str]) -> str:

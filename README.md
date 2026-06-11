@@ -1162,27 +1162,26 @@ file sizes tractable across the 35-evaluation matrix.
 ### LLM-as-judge — OpenAI gpt-5-mini by default
 
 A second, qualitative score comes from a separate language-model
-judge. The judge follows a 5-step procedure laid out in its system
-prompt: extract zones from each paragraph, list them in a side-by-
-side comparison table, score each pair 0..100 with a one-sentence
-justification, average the per-zone scores, and emit the final
-result on the last line wrapped in `[N]`. The bracketed format makes
-the aggregate score unambiguous to extract — `parse_judge_score`
-picks the last single-integer bracket in the reply, ignoring the
-many `[a, b]` temperature ranges the comparison table contains. The
-judge sees **the raw output with brackets intact** (not the fluent
-rewrite), GT paragraph, and nothing else — no scenario, mode, or
-fold metadata, so it's a blind pairwise comparison.
+judge. The judge follows a 4-step procedure laid out in its system
+prompt: extract zones + intervals from each paragraph as **two
+lists of `[zone, [a, b]]` pairs** (one per paragraph), write a
+one-sentence motivation explaining the differences between the two
+lists, then emit a single integer accuracy score on the last line
+wrapped in `[N]`. The bracketed format makes the aggregate score
+unambiguous to extract — `parse_judge_score` picks the last
+single-integer bracket in the reply, ignoring the many `[a, b]`
+temperature ranges the lists contain. The judge sees **the raw
+output with brackets intact** (not the fluent rewrite), GT
+paragraph, and nothing else — no scenario, mode, or fold metadata,
+so it's a blind pairwise comparison.
 
 ```
-JUDGE SYSTEM PROMPT (5 steps):
-  1. Extract zones + temperature intervals from both paragraphs.
-  2. Build a side-by-side table:
-       Zona | Interval REFERINTA | Interval PREDICTIE | Scor | Motiv
-  3. Score each pair 0..100 (closer overlap -> higher score) with
-     a one-sentence justification.
-  4. Average the per-zone scores.
-  5. Print the average on the last line as [N].
+JUDGE SYSTEM PROMPT (4 steps):
+  1. Extract REFERINTA -> list of [zona, [a, b]] pairs.
+  2. Extract PREDICTIE -> a second list of [zona, [a, b]] pairs.
+  3. One-sentence motivation: differences between the two lists
+     (missing/extra zones, distance between intervals).
+  4. Print the chosen accuracy score on the last line as [N].
 
 JUDGE USER PROMPT:
     REFERINTA:
@@ -1191,16 +1190,17 @@ JUDGE USER PROMPT:
     PREDICTIE:
     <raw model output with [x, y] brackets>
 
-    Raspunde urmand procedura din 5 pasi.
-    Ultima linie a raspunsului tau trebuie sa fie [N], unde N este media.
+    Raspunde urmand procedura din 4 pasi.
+    Ultima linie a raspunsului tau trebuie sa fie [N],
+    unde N este scorul de acuratete.
 ```
 
 Default backend: **OpenAI Responses API, `gpt-5-mini`, `reasoning.effort=
-"minimal"`, `max_output_tokens=4096`**. The 4K output cap accommodates
-the per-zone justification table; reasoning + visible reply together
-fit comfortably below the limit for typical 25–30-zone paragraphs.
-The key is read from `OPENAI_API_KEY` only — there is no fallback
-file, no config key, no hardcoded literal.
+"minimal"`, `max_output_tokens=2048`**. The 2K output cap
+comfortably accommodates the two lists + the one-sentence motivation
++ the final `[N]` for typical 25–30-zone paragraphs. The key is read
+from `OPENAI_API_KEY` only — there is no fallback file, no config
+key, no hardcoded literal.
 
 ```
 setx OPENAI_API_KEY "sk-..."     # one-time, persisted; reopen terminal after
