@@ -3693,7 +3693,18 @@ def plot_judge_style_comparison(
             zs_js = (rec_zs.get("judge_score") or {}) if rec_zs else {}
             ct_score = ct_js.get("judge_accuracy")
             zs_score = zs_js.get("judge_accuracy")
-            motivation = ct_js.get("judge_motivation") or "(no motivation parsed)"
+            # Re-extract the motivation from the raw reply on every
+            # plot run so the figure reflects the current PASUL-3-
+            # anchored regex, not whatever stale value is stored in
+            # the JSON (older runs used the legacy 'Motivatie:' prefix
+            # extractor which leaked 'PASUL 4 - Rezultat:' as the
+            # fallback when the prefix was inside a header line).
+            raw_reply = ct_js.get("judge_raw_reply") or ""
+            motivation = (
+                extract_judge_motivation(raw_reply)
+                or ct_js.get("judge_motivation")
+                or "(no motivation parsed)"
+            )
 
             header = (
                 f"{row['scenario']} fold_n={row['fold_n']} mode={row['mode']} "
