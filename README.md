@@ -872,30 +872,50 @@ produces a single comparison plot that includes both families.
 | `run` | Runs the (5 input modes × 7 folds) test matrix for **one** Ollama LLM and writes a per-model JSON for the plotter | `llm_runs/llm_runs_<model>.json` plus, if any prompt truncates or any output is cut off, an append-only line in `llm_runs/logs/token_limits_<model>.log` |
 | `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known April days, synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
 | `postprocess` | Re-applies the fluent-Romanian rewriter over every `llm_runs_*.json` without rerunning any LLM. Useful for iterating on the rewriter (quantifier handling, snapping, unit formats) once raw paragraphs are already on disk | Updates `predicted_paragraph_fluent` in place; optionally writes `.json.bak` backups |
-| `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary and two figure families — per-scenario accuracy curves vs fold size, and manual-vs-judge agreement scatter per model | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png` |
+| `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary, per-scenario accuracy curves vs fold size, manual-vs-judge agreement scatter, and a side-by-side top-3-paragraphs comparison per model (ranked by manual + by judge) | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png`, `llm_runs/plots/top3_comparison_<model>_by_{manual,judge}_accuracy.png` |
 
 ```
 python -m prompting.utils.llm_comparison <subcommand> [--flags]
 ```
 
-### Five input modes × two scenarios = 35 evaluations per model
+### Eight input modes × two scenarios = 56 evaluations per model
 
 The runner iterates a Cartesian product:
 
 ```
-modes:      historic_only        text from past months' ANM diagnoses
-            historic_plus_temp   text + per-zone monthly temperature numbers
-            historic_plus_aux    text + temp + precip + wind + nebulosity
-            temp_only            no text, just per-zone temperature numbers
-            aux_only             no text, no temperature, just aux numbers
-scenarios:  monthly  folds = (3, 6, 9)        K known months -> predict month K+1
-            daily    folds = (6, 12, 18, 24)  K known days   -> predict full month
-                                              (default target = April)
+modes:      historic_only                  text from past months' ANM diagnoses
+            historic_plus_temp             text + per-zone monthly temperature
+            historic_plus_aux              text + temp + precip + wind + nebulosity
+            temp_only                      no text, just per-zone temperature
+            aux_only                       no text, no temp, just aux numbers
+            historic_only_with_prior       historic_only + target-month paragraphs
+                                           from prior years (default 3 most recent)
+            historic_plus_temp_with_prior  historic_plus_temp + prior-year context
+            historic_plus_aux_with_prior   historic_plus_aux + prior-year context
+scenarios:  monthly  folds = (3, 6, 9)         K known months -> predict month K+1
+            daily    folds = (6, 12, 18, 24)   K known days   -> predict full month
+                                               (default target = November)
 ```
 
 A "fold" here is the number of **known** historical units (months or
 days) the model sees in the user prompt — the scenario analogue of
 the baselines' `--folds` count.
+
+The three `*_with_prior` modes augment their base mode with target-
+month ANM paragraphs from the `--n_prior_years` years preceding the
+target year (default 3, counting down). With `--year 2024
+--n_prior_years 3`, each `*_with_prior` user prompt has an extra
+`CARACTERIZARI ISTORICE PENTRU LUNA <X> DIN ANII ANTERIORI` section
+showing paragraphs from 2023, 2022 and 2021 (whichever
+`historic_data_<year>.json` files are present in `--date_folder`;
+missing years are silently skipped). Setting `--n_prior_years 0`
+filters the prior-year modes out of the run, falling back to the
+original 5×7 = 35-eval matrix.
+
+The November default for the daily scenario gives the model the
+longest possible in-year context window (10 prior months of ANM
+text, Jan..Oct) — change with `--daily_test_month` if you want a
+different seasonal regime.
 
 ### Zone vocabulary
 
@@ -993,6 +1013,41 @@ runner's console output when `N > 0`, so format violations are
 visible during the run. Per-record `interval_raw` is kept alongside
 the snapped `interval` for after-the-fact auditing of which models
 need the strictest prompt enforcement.
+
+### Top-3 paragraph comparison figure
+
+For each model the plotter renders two large composite PNGs ranking
+the model's three best evaluations: one **by manual_accuracy**, one
+**by judge_accuracy**. Each composite is a 3×4 grid:
+
+```
+GT paragraph text   |   GT zone -> [a, b] table   |   PRED paragraph (filtered)   |   PRED zone -> [a, b] table
+```
+
+per row, with a header per cell stating scenario / fold_n / mode /
+target_month plus both accuracy scores. The zone tables are
+re-extracted at plot time via the same parser `manual_score` uses
+(zone vocabulary lookup + interval pairing), so the side tables show
+exactly what the scorer was actually consuming, not what the prose
+*looked* like it said.
+
+The extractor handles both formats out of the box:
+
+- **Prediction side** — `[a, b]` brackets (the model's compliant
+  format).
+- **GT side** — fluent Romanian (`"între 4 și 6 °C"`, `"peste 6 °C"`,
+  `"sub 0 °C"`); `peste A` → `[A, A+2]`, `sub A` → `[A-2, A]`,
+  `intre A si B` → `[A, B]`, all snapped to the 2 °C grid afterwards.
+  This is what makes the GT column populate at all — without fluent
+  recognition the GT table would be empty.
+
+Use this figure to read at a glance: which scenario/fold/mode each
+model excels in, how close its fluent prose actually gets to ANM
+style, whether the zone coverage matches (same set of regions /
+climatic zones / cardinal subdivisions present in both columns),
+and where the manual and judge rankings disagree (a row appearing
+in only one of the two PNGs means the two scorers picked different
+bests for that model).
 
 ### Fluent post-processing — quantifier-aware, paragraph-aware
 
@@ -1107,13 +1162,28 @@ file sizes tractable across the 35-evaluation matrix.
 ### LLM-as-judge — OpenAI gpt-5-mini by default
 
 A second, qualitative score comes from a separate language-model
-judge whose system prompt asks for a SINGLE integer 0..100 (the
-percentage of accuracy), no prose. The judge sees **the raw output
-with brackets intact** (not the fluent rewrite), GT paragraph, and
-nothing else — no scenario, mode, or fold metadata, so it's a blind
-pairwise comparison.
+judge. The judge follows a 5-step procedure laid out in its system
+prompt: extract zones from each paragraph, list them in a side-by-
+side comparison table, score each pair 0..100 with a one-sentence
+justification, average the per-zone scores, and emit the final
+result on the last line wrapped in `[N]`. The bracketed format makes
+the aggregate score unambiguous to extract — `parse_judge_score`
+picks the last single-integer bracket in the reply, ignoring the
+many `[a, b]` temperature ranges the comparison table contains. The
+judge sees **the raw output with brackets intact** (not the fluent
+rewrite), GT paragraph, and nothing else — no scenario, mode, or
+fold metadata, so it's a blind pairwise comparison.
 
 ```
+JUDGE SYSTEM PROMPT (5 steps):
+  1. Extract zones + temperature intervals from both paragraphs.
+  2. Build a side-by-side table:
+       Zona | Interval REFERINTA | Interval PREDICTIE | Scor | Motiv
+  3. Score each pair 0..100 (closer overlap -> higher score) with
+     a one-sentence justification.
+  4. Average the per-zone scores.
+  5. Print the average on the last line as [N].
+
 JUDGE USER PROMPT:
     REFERINTA:
     <full ANM paragraph for the target month>
@@ -1121,13 +1191,16 @@ JUDGE USER PROMPT:
     PREDICTIE:
     <raw model output with [x, y] brackets>
 
-    Acuratețe (0-100):
+    Raspunde urmand procedura din 5 pasi.
+    Ultima linie a raspunsului tau trebuie sa fie [N], unde N este media.
 ```
 
 Default backend: **OpenAI Responses API, `gpt-5-mini`, `reasoning.effort=
-"minimal"`, `max_output_tokens=2048`**. The key is read from
-`OPENAI_API_KEY` only — there is no fallback file, no config key, no
-hardcoded literal.
+"minimal"`, `max_output_tokens=4096`**. The 4K output cap accommodates
+the per-zone justification table; reasoning + visible reply together
+fit comfortably below the limit for typical 25–30-zone paragraphs.
+The key is read from `OPENAI_API_KEY` only — there is no fallback
+file, no config key, no hardcoded literal.
 
 ```
 setx OPENAI_API_KEY "sk-..."     # one-time, persisted; reopen terminal after
@@ -1228,7 +1301,8 @@ evaluation so a crash loses at most one prediction.
 | `--judge_model` | provider-default | `gpt-5-mini` for OpenAI; `--model` for Ollama |
 | `--dry_run` | off | Use a mock client that returns canned Romanian paragraphs — no HTTP, no GPU. Verifies orchestration end-to-end |
 | `--ollama_base_url` | `http://localhost:11434` | |
-| `--num_ctx` | 32768 | Ollama context window. Largest user prompt we produce is ~16K input tokens, so 32K leaves safe margin |
+| `--num_ctx` | 36864 | Ollama context window. The largest user prompt the runner produces is the `*_with_prior` daily mode at K=24 with 3 prior years of November paragraphs + 10 in-year prior months + 24 days of per-zone data ≈ ~30K tokens; 36864 leaves headroom for the model's output |
+| `--n_prior_years` | 3 | How many years before `--year` contribute target-month ANM paragraphs to the three `*_with_prior` modes. Counting down: with `--year 2024 --n_prior_years 3`, paragraphs from 2023/2022/2021 are loaded. Missing files silently skipped. 0 disables the prior-year modes entirely |
 | `--temperature` | 0.2 | Low so the `[x, y]` format constraint is consistently honoured |
 | `--keep_alive` | `30m` | Keeps the model loaded in GPU between calls |
 | `--date_folder` | `date` | Holds `stations_metadata.json`, `temperature_*.json`, `daily_county_*.csv`, `historic_data_*.json` |
@@ -1316,7 +1390,9 @@ llm_runs/
     ├── llm_manual_accuracy_daily.png                  <- LLMs + baselines overlaid, colour by mode
     ├── llm_judge_accuracy_monthly.png
     ├── llm_judge_accuracy_daily.png
-    └── manual_vs_judge_<model>.png                    <- one per model, y=x ref + Spearman corr
+    ├── manual_vs_judge_<model>.png                    <- one per model, y=x ref + Spearman corr
+    ├── top3_comparison_<model>_by_manual_accuracy.png <- top-3 evals by manual score, side by side
+    └── top3_comparison_<model>_by_judge_accuracy.png  <- top-3 evals by judge score, side by side
 ```
 
 Each per-evaluation record in the JSON contains:

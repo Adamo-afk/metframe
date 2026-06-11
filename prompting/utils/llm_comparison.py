@@ -507,6 +507,53 @@ _INTERVAL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Fluent-Romanian forms used in the ANM GT paragraphs (no brackets):
+#   "intre 4 si 6 °C"  -> (4, 6)
+#   "peste 6 °C"       -> (6, 8)    semi-open above, snapped to 2 degC bin
+#   "sub 0 °C"         -> (-2, 0)   semi-open below
+# 'peste' / 'sub' require a temperature unit (°C / C / degC / grade
+# Celsius) so we don't false-match prose like "sub 5 minute". Unit
+# spellings cover all ANM-typical variants.
+_TEMP_UNIT_PATTERN = (
+    r"(?:\xb0\s*[Cc]|deg\s*[Cc]|grad[ei]?(?:\s+Celsius)?|[Cc]\b)"
+)
+_INTRE_INTERVAL_RE = re.compile(
+    r"\b(?:intre|într?e|între)\s+(-?\d+(?:\.\d+)?)\s+(?:si|și)\s+"
+    r"(-?\d+(?:\.\d+)?)"
+    r"(?:\s*" + _TEMP_UNIT_PATTERN + r")?",
+    flags=re.IGNORECASE,
+)
+_PESTE_INTERVAL_RE = re.compile(
+    r"\bpeste\s+(-?\d+(?:\.\d+)?)\s*" + _TEMP_UNIT_PATTERN,
+    flags=re.IGNORECASE,
+)
+_SUB_INTERVAL_RE = re.compile(
+    r"\bsub\s+(-?\d+(?:\.\d+)?)\s*" + _TEMP_UNIT_PATTERN,
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_fluent_intervals(text: str) -> List[Tuple[int, int, float, float]]:
+    """
+    Return [(start, end, a_raw, b_raw), ...] for fluent Romanian
+    temperature expressions: 'intre A si B' (range), 'peste A' (open
+    above), 'sub A' (open below). 'peste'/'sub' yield a 2 degC bin
+    anchored at A: peste -> (A, A+2), sub -> (A-2, A). The caller
+    still passes the result through _snap_to_2c_bin so the final
+    interval is always on the standard grid.
+    """
+    out: List[Tuple[int, int, float, float]] = []
+    for m in _INTRE_INTERVAL_RE.finditer(text):
+        out.append((m.start(), m.end(),
+                    float(m.group(1)), float(m.group(2))))
+    for m in _PESTE_INTERVAL_RE.finditer(text):
+        a = float(m.group(1))
+        out.append((m.start(), m.end(), a, a + 2.0))
+    for m in _SUB_INTERVAL_RE.finditer(text):
+        b = float(m.group(1))
+        out.append((m.start(), m.end(), b - 2.0, b))
+    return out
+
 
 _BIN_WIDTH_C: float = 2.0
 
@@ -601,6 +648,17 @@ def extract_predictions_from_paragraph(
                 m.start(), m.end(),
                 x_snap, y_snap,
                 x_raw, y_raw, was_snapped,
+            ))
+        # Also pick up fluent Romanian forms ('intre A si B', 'peste A',
+        # 'sub A') so GT paragraphs (which never use brackets) populate
+        # zone+interval pairs too. Predictions normally use brackets,
+        # but the same path tolerates fluent post-processed outputs.
+        for start, end, a_raw, b_raw in _extract_fluent_intervals(sent):
+            a_snap, b_snap, was_snapped = _snap_to_2c_bin(a_raw, b_raw)
+            intervals.append((
+                start, end,
+                a_snap, b_snap,
+                a_raw, b_raw, was_snapped,
             ))
         if not intervals:
             continue
@@ -919,7 +977,31 @@ MODES = (
     "historic_plus_aux",
     "temp_only",
     "aux_only",
+    "historic_only_with_prior",
+    "historic_plus_temp_with_prior",
+    "historic_plus_aux_with_prior",
 )
+
+# Modes whose user prompt embeds prior-year target-month ANM
+# paragraphs in addition to the same-year prior-month context. When
+# --n_prior_years is 0 these modes are silently filtered from any
+# selected run (no prior-year data available -> they would be
+# byte-identical to their non-prior counterparts and pollute the
+# comparison plot).
+PRIOR_YEAR_MODES = (
+    "historic_only_with_prior",
+    "historic_plus_temp_with_prior",
+    "historic_plus_aux_with_prior",
+)
+
+# Base historic mode name a prior-year mode is built on. Used by
+# the prompt builders to decide which information blocks to include
+# (text only, text + temp, text + aux).
+_PRIOR_YEAR_BASE_MODE: Dict[str, str] = {
+    "historic_only_with_prior":      "historic_only",
+    "historic_plus_temp_with_prior": "historic_plus_temp",
+    "historic_plus_aux_with_prior":  "historic_plus_aux",
+}
 
 SCENARIOS = ("monthly", "daily")
 
@@ -1040,6 +1122,7 @@ def build_user_prompt_monthly(
     zones: List[Dict],
     aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
     date_folder: str = "date",
+    prior_year_paragraphs: Optional[Dict[int, str]] = None,
 ) -> str:
     """
     Build the monthly-scenario user prompt.
@@ -1053,6 +1136,9 @@ def build_user_prompt_monthly(
         zones: deduplicated zone records extracted from those paragraphs.
         aux_matrices: required for modes that include aux; dict of pd.DataFrame
             keyed by 'temp', 'precip', 'wind', 'nebulosity'.
+        prior_year_paragraphs: optional {year -> paragraph} for the target
+            month from prior years. Consumed only by the `*_with_prior`
+            modes; passed through as None for the other modes.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -1066,6 +1152,13 @@ def build_user_prompt_monthly(
 
     target_label = romanian_month_name(target_month)
     known_labels = [romanian_month_name(m) for m in known_months]
+    base_mode = _PRIOR_YEAR_BASE_MODE.get(mode, mode)
+    show_historic = base_mode in (
+        "historic_only", "historic_plus_temp", "historic_plus_aux"
+    )
+    show_data = base_mode in (
+        "historic_plus_temp", "historic_plus_aux", "temp_only", "aux_only"
+    )
 
     parts = [
         f"Cunoastem caracterizarile climatice si/sau datele observate pentru "
@@ -1080,7 +1173,23 @@ def build_user_prompt_monthly(
         parts.append(f"  - {zone_label_romanian(z)}")
     parts.append("")
 
-    if mode in ("historic_only", "historic_plus_temp", "historic_plus_aux"):
+    if (
+        mode in PRIOR_YEAR_MODES
+        and prior_year_paragraphs
+        and show_historic
+    ):
+        parts.append(
+            f"CARACTERIZARI ISTORICE PENTRU LUNA {target_label.upper()} "
+            f"DIN ANII ANTERIORI (referinta climatologica, NU adevarul "
+            f"pentru {year}):"
+        )
+        for prior_year in sorted(prior_year_paragraphs.keys(), reverse=True):
+            para = prior_year_paragraphs[prior_year]
+            if para:
+                parts.append(f"  {target_label} {prior_year}: {para}")
+        parts.append("")
+
+    if show_historic:
         parts.append("CARACTERIZARI ISTORICE (din arhiva ANM):")
         for m, label in zip(known_months, known_labels):
             para = historic_paragraphs.get(label, "")
@@ -1088,10 +1197,11 @@ def build_user_prompt_monthly(
                 parts.append(f"  {label}: {para}")
         parts.append("")
 
-    if mode in ("historic_plus_temp", "historic_plus_aux",
-                "temp_only", "aux_only"):
-        include_temp = mode in ("historic_plus_temp", "historic_plus_aux", "temp_only")
-        include_aux = mode in ("historic_plus_aux", "aux_only")
+    if show_data:
+        include_temp = base_mode in (
+            "historic_plus_temp", "historic_plus_aux", "temp_only"
+        )
+        include_aux = base_mode in ("historic_plus_aux", "aux_only")
         if include_temp and include_aux:
             header = "DATE OBSERVATE (temperatura medie + auxiliare per zona, lunar):"
         elif include_temp:
@@ -1127,13 +1237,18 @@ def build_user_prompt_daily(
     historic_paragraphs: Dict[str, str],
     zones: List[Dict],
     aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
+    prior_year_paragraphs: Optional[Dict[int, str]] = None,
 ) -> str:
     """
     Build the daily-scenario user prompt.
 
-    The model knows the first `n_known_days` of the target month (per zone,
-    daily observed values) and the historic paragraphs of all months PRIOR
-    to the target month. It must produce the FULL-month caracterizare.
+    The model knows the first `n_known_days` of the target month (per
+    zone, daily observed values) and the historic paragraphs of all
+    months PRIOR to the target month. It must produce the FULL-month
+    caracterizare.
+
+    `prior_year_paragraphs` ({year -> paragraph}) is consumed only by
+    the `*_with_prior` modes; non-prior modes ignore it.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -1142,6 +1257,13 @@ def build_user_prompt_daily(
     # Previous months for the historic-paragraph context.
     previous_months = list(range(1, target_month))
     previous_labels = [romanian_month_name(m) for m in previous_months]
+    base_mode = _PRIOR_YEAR_BASE_MODE.get(mode, mode)
+    show_historic = base_mode in (
+        "historic_only", "historic_plus_temp", "historic_plus_aux"
+    )
+    show_data = base_mode in (
+        "historic_plus_temp", "historic_plus_aux", "temp_only", "aux_only"
+    )
 
     parts = [
         f"Cunoastem caracterizarile climatice ale lunilor anterioare "
@@ -1161,7 +1283,23 @@ def build_user_prompt_daily(
         parts.append(f"  - {zone_label_romanian(z)}")
     parts.append("")
 
-    if mode in ("historic_only", "historic_plus_temp", "historic_plus_aux"):
+    if (
+        mode in PRIOR_YEAR_MODES
+        and prior_year_paragraphs
+        and show_historic
+    ):
+        parts.append(
+            f"CARACTERIZARI ISTORICE PENTRU LUNA {target_label.upper()} "
+            f"DIN ANII ANTERIORI (referinta climatologica, NU adevarul "
+            f"pentru {year}):"
+        )
+        for prior_year in sorted(prior_year_paragraphs.keys(), reverse=True):
+            para = prior_year_paragraphs[prior_year]
+            if para:
+                parts.append(f"  {target_label} {prior_year}: {para}")
+        parts.append("")
+
+    if show_historic:
         if previous_labels:
             parts.append("CARACTERIZARI ISTORICE (lunile anterioare lunii prognozate):")
             for m, label in zip(previous_months, previous_labels):
@@ -1170,10 +1308,11 @@ def build_user_prompt_daily(
                     parts.append(f"  {label}: {para}")
             parts.append("")
 
-    if mode in ("historic_plus_temp", "historic_plus_aux",
-                "temp_only", "aux_only"):
-        include_temp = mode in ("historic_plus_temp", "historic_plus_aux", "temp_only")
-        include_aux = mode in ("historic_plus_aux", "aux_only")
+    if show_data:
+        include_temp = base_mode in (
+            "historic_plus_temp", "historic_plus_aux", "temp_only"
+        )
+        include_aux = base_mode in ("historic_plus_aux", "aux_only")
         if include_temp and include_aux:
             header = (
                 f"DATE OBSERVATE ZILNIC (temperatura + auxiliare per zona, "
@@ -1213,6 +1352,47 @@ def build_user_prompt_daily(
     return "\n".join(parts)
 
 
+def load_prior_year_target_month_paragraphs(
+    *,
+    target_year: int,
+    target_month: int,
+    n_prior_years: int,
+    date_folder: str | Path = "date",
+    filename_pattern: str = "historic_data_{year}.json",
+) -> Dict[int, str]:
+    """
+    Load the target-month ANM paragraph from each of the `n_prior_years`
+    years preceding `target_year`. Counting down: target_year=2024 with
+    n_prior_years=2 returns paragraphs from 2023 and 2022 (the two most
+    recent prior years).
+
+    Missing files are silently skipped (e.g. n_prior_years=3 on 2024 with
+    only 2021/2022/2023 archives gives all three; raising n_prior_years
+    further would just return what is available).
+
+    Returns: { year: paragraph_text } - empty dict if nothing was found.
+    """
+    if n_prior_years <= 0:
+        return {}
+    target_label = romanian_month_name(target_month)
+    out: Dict[int, str] = {}
+    for k in range(1, n_prior_years + 1):
+        y = target_year - k
+        path = Path(date_folder) / filename_pattern.format(year=y)
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        except Exception as e:
+            print(f"  warn: failed to read {path.name}: {e}; skipping {y}")
+            continue
+        para = (blob.get("caracterizare_lunara") or {}).get(target_label, "")
+        if para:
+            out[y] = para
+    return out
+
+
 # Driver helper: given a scenario + fold + mode, extract the zones from
 # the right historic paragraphs and build the prompt. This is the
 # function the runner will call per (model, mode, scenario, fold).
@@ -1227,12 +1407,17 @@ def build_prompt_pair(
     metadata: dict,
     aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
     date_folder: str = "date",
+    prior_year_paragraphs: Optional[Dict[int, str]] = None,
 ) -> Tuple[str, str, List[Dict], str]:
     """
     Returns (system_prompt, user_prompt, deduped_zones, gt_paragraph).
 
     `gt_paragraph` is the historic_data paragraph for the target month
     (kept alongside so the scoring code has a single object to consume).
+
+    `prior_year_paragraphs` (year -> paragraph) is only consumed by the
+    three `*_with_prior` modes; non-prior modes ignore it so the same
+    runner can interleave both families without separate dispatch.
     """
     if scenario not in SCENARIOS:
         raise ValueError(f"scenario must be one of {SCENARIOS}, got {scenario!r}")
@@ -1264,6 +1449,13 @@ def build_prompt_pair(
         para = paragraphs.get(romanian_month_name(m), "")
         if para:
             all_zones.extend(extract_zones_from_text(para, metadata))
+    # The `*_with_prior` modes also see prior-year target-month
+    # paragraphs in the user prompt - widen the zone vocabulary so
+    # the LLM's required-coverage list reflects what it can read.
+    if mode in PRIOR_YEAR_MODES and prior_year_paragraphs:
+        for para in prior_year_paragraphs.values():
+            if para:
+                all_zones.extend(extract_zones_from_text(para, metadata))
     zones = dedupe_zones(all_zones)
 
     system_prompt = build_system_prompt()
@@ -1272,12 +1464,14 @@ def build_prompt_pair(
             fold_n=fold_n, target_month=target_month, year=year, mode=mode,
             historic_paragraphs=paragraphs, zones=zones,
             aux_matrices=aux_matrices, date_folder=date_folder,
+            prior_year_paragraphs=prior_year_paragraphs,
         )
     else:
         user_prompt = build_user_prompt_daily(
             n_known_days=fold_n, target_month=target_month, year=year, mode=mode,
             historic_paragraphs=paragraphs, zones=zones,
             aux_matrices=aux_matrices,
+            prior_year_paragraphs=prior_year_paragraphs,
         )
 
     return system_prompt, user_prompt, zones, gt_paragraph
@@ -1659,24 +1853,44 @@ def manual_score(
 # LLM-as-a-judge scorer
 # ---------------------------------------------------------------------------
 
-JUDGE_SYSTEM_PROMPT_RO = """Esti un evaluator climatic specializat. Vei primi
-doua paragrafe:
+JUDGE_SYSTEM_PROMPT_RO = """Esti un evaluator climatic specializat. Primesti
+doua paragrafe in limba romana:
 
-  1) Paragraful de referinta (adevarul, asa cum apare in arhiva ANM).
-  2) Paragraful generat (predictia unui model).
+  1) REFERINTA - adevarul, asa cum apare in arhiva ANM.
+  2) PREDICTIE - paragraful generat de un model.
 
-Compara cele doua paragrafe si determina cat de exact este paragraful
-generat fata de referinta. Considera:
+Procedura ta:
 
-  - Acoperirea geografica (aceleasi regiuni, zone climatice, subdiviziuni
-    cardinale sunt mentionate).
-  - Acuratețea intervalelor de temperatura (intervalele predictiei se
-    suprapun cu ce ar fi spus referinta).
-  - Consistența cu structura de caracterizare ANM.
+PASUL 1 - Extragere. Din fiecare paragraf identifica toate zonele
+mentionate impreuna cu intervalele lor de temperatura. Zonele pot fi:
+  - parti cardinale ale unei regiuni (ex: 'sud-estul Munteniei',
+    'nord-vestul Banatului'),
+  - regiuni intregi (ex: 'Muntenia', 'Transilvania', 'Moldova'),
+  - zone climatice (ex: 'litoral', 'Delta Dunarii', 'zona montana
+    inalta', 'Subcarpati', 'campie').
 
-Returneaza UN SINGUR numar intreg intre 0 si 100, reprezentand procentul
-de acuratețe (100 = identice ca informație, 0 = complet gresit). NU
-adauga explicații, comentarii sau text suplimentar - DOAR numarul.
+PASUL 2 - Tabel comparativ. Listeaza zonele in paralel:
+
+  Zona | Interval REFERINTA | Interval PREDICTIE | Scor (0-100) | Motiv
+
+  Pune o linie pentru fiecare zona care apare in oricare paragraf.
+  Daca o zona apare in unul singur, marcheaza celalalt cu '-' si
+  trateaza ca scor 0.
+
+PASUL 3 - Scor per zona (intreg in [0, 100]). Cu cat este mai mare
+distanta, cu atat scorul este mai mic. Motiveaza alegerea
+procentajului intr-o singura propozitie scurta si concreta.
+
+PASUL 4 - Agregare. Calculeaza media aritmetica:
+  media = (sum scoruri per zona) / (numar zone)
+
+PASUL 5 - Rezultat. Pe ULTIMA linie, scrie media calculata ca un
+singur numar intreg intre paranteze drepte, exact in acest format:
+
+  [N]
+
+unde N este cuprins intre 0 si 100. Scrie doar [N] pe ultima linie
+ca rezultat final. Exemplu: [73]
 """
 
 JUDGE_USER_PROMPT_TEMPLATE = """REFERINTA:
@@ -1685,7 +1899,8 @@ JUDGE_USER_PROMPT_TEMPLATE = """REFERINTA:
 PREDICTIE:
 {pred}
 
-Acuratețe (0-100):"""
+Raspunde urmand procedura din 5 pasi din mesajul de sistem. Ultima
+linie a raspunsului tau trebuie sa fie [N], unde N este media."""
 
 
 def build_judge_prompt(gt_paragraph: str, predicted_paragraph: str) -> Tuple[str, str]:
@@ -1699,23 +1914,37 @@ def build_judge_prompt(gt_paragraph: str, predicted_paragraph: str) -> Tuple[str
     )
 
 
-# Robust integer-percentage extractor. The judge prompt asks for "a
-# single integer 0-100" but a model might wrap it in punctuation,
-# emit a percent sign, add a leading newline, or even reply with
-# something like "Acuratețe: 73%". This regex finds the FIRST integer
-# in [0, 100] in the reply, optionally followed by a '%'.
+# The new judge prompt asks for the aggregate score on the last line
+# wrapped in '[]' WITHOUT a comma inside (e.g. [73]). That marker is
+# distinguishable from the temperature ranges [a, b] sprinkled
+# throughout the comparison table, which always contain a comma.
+# Pick the LAST occurrence of a single-integer bracket so per-zone
+# justifications that happen to use 'scor [N]' inline don't get
+# mistaken for the aggregate.
+_RESULT_BRACKET_RE = re.compile(r"\[\s*(\d{1,3})\s*\]")
+
+# Fallback: plain integer-percentage extractor for replies that
+# ignore the bracket convention. Kept so a misbehaving judge still
+# produces a score instead of an unscored row.
 _PERCENT_RE = re.compile(r"(?<![-\d.])(\d{1,3})(?:\s*%)?(?![.\d])")
 
 
 def parse_judge_score(reply: str) -> Optional[int]:
     """
-    Extract the 0..100 integer the judge was asked to return. Returns
-    None if no plausible integer can be parsed (the runner should
-    treat this as a missing score and log it).
+    Extract the 0..100 integer the judge was asked to return on the
+    last line wrapped in '[]'. Falls back to the legacy bare-integer
+    extractor (last value in [0, 100]) only when no bracketed marker
+    is present so a non-compliant judge still produces a score.
     """
     if not reply:
         return None
-    for m in _PERCENT_RE.finditer(reply):
+    bracket_matches = _RESULT_BRACKET_RE.findall(reply)
+    if bracket_matches:
+        for raw in reversed(bracket_matches):
+            v = int(raw)
+            if 0 <= v <= 100:
+                return v
+    for m in reversed(list(_PERCENT_RE.finditer(reply))):
         v = int(m.group(1))
         if 0 <= v <= 100:
             return v
@@ -1745,7 +1974,7 @@ def parse_judge_score(reply: str) -> Optional[int]:
 # model in the iteration.
 
 _OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434"
-_OLLAMA_DEFAULT_NUM_CTX = 32768
+_OLLAMA_DEFAULT_NUM_CTX = 36864
 _OLLAMA_DEFAULT_KEEP_ALIVE = "30m"
 _OLLAMA_DEFAULT_TEMPERATURE = 0.2
 
@@ -1884,7 +2113,7 @@ class MockOllamaClient:
 
 _OPENAI_JUDGE_DEFAULT_MODEL = "gpt-5-mini"
 _OPENAI_JUDGE_REASONING_EFFORT = "minimal"
-_OPENAI_JUDGE_MAX_OUTPUT_TOKENS = 2048
+_OPENAI_JUDGE_MAX_OUTPUT_TOKENS = 4096
 
 
 def _resolve_openai_api_key(provided: Optional[str]) -> str:
@@ -2137,10 +2366,11 @@ def run_llm_tests(
     historic_data_path: str | Path,
     output_dir: str | Path = "llm_runs",
     year: int = 2024,
-    daily_test_month: int = 4,
+    daily_test_month: int = 11,
     aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
     modes: Sequence[str] = MODES,
     date_folder: str = "date",
+    n_prior_years: int = 3,
     on_progress=None,
 ) -> Dict:
     """
@@ -2183,6 +2413,13 @@ def run_llm_tests(
     print(f"Output: {out_path}")
     print(f"{'=' * 60}")
 
+    # Drop the prior-year modes when no prior-year history is being
+    # consumed: they would be byte-identical to their base modes and
+    # only add noise to the plot.
+    effective_modes = list(modes)
+    if n_prior_years <= 0:
+        effective_modes = [m for m in effective_modes if m not in PRIOR_YEAR_MODES]
+
     run_metadata = {
         "model": model_name,
         "dry_run": is_dry_run,
@@ -2190,7 +2427,8 @@ def run_llm_tests(
         "daily_test_month": daily_test_month,
         "monthly_folds": list(MONTHLY_FOLDS),
         "daily_folds": list(DAILY_FOLDS),
-        "modes": list(modes),
+        "modes": list(effective_modes),
+        "n_prior_years": int(n_prior_years),
         "num_ctx": getattr(client, "num_ctx", None),
     }
     results: List[Dict] = []
@@ -2202,7 +2440,22 @@ def run_llm_tests(
                 f, ensure_ascii=False, indent=2,
             )
 
-    total = (len(MONTHLY_FOLDS) + len(DAILY_FOLDS)) * len(modes)
+    # Prior-year target-month paragraphs are constant across folds for
+    # a given target_month, so cache to avoid reading the JSON files
+    # 7 times per target.
+    prior_cache: Dict[int, Dict[int, str]] = {}
+
+    def _get_prior_paragraphs(tm: int) -> Dict[int, str]:
+        if tm not in prior_cache:
+            prior_cache[tm] = (
+                load_prior_year_target_month_paragraphs(
+                    target_year=year, target_month=tm,
+                    n_prior_years=n_prior_years, date_folder=date_folder,
+                ) if n_prior_years > 0 else {}
+            )
+        return prior_cache[tm]
+
+    total = (len(MONTHLY_FOLDS) + len(DAILY_FOLDS)) * len(effective_modes)
     done = 0
     for scenario, folds in (("monthly", MONTHLY_FOLDS), ("daily", DAILY_FOLDS)):
         for fold_n in folds:
@@ -2210,7 +2463,7 @@ def run_llm_tests(
                 target_month = _monthly_target_month(fold_n)
             else:
                 target_month = daily_test_month
-            for mode in modes:
+            for mode in effective_modes:
                 done += 1
                 print(f"\n[{done}/{total}] {scenario} fold={fold_n} target={target_month:02d} "
                       f"mode={mode}")
@@ -2221,6 +2474,7 @@ def run_llm_tests(
                         historic_data_path=historic_data_path,
                         metadata=metadata, aux_matrices=aux_matrices,
                         date_folder=date_folder,
+                        prior_year_paragraphs=_get_prior_paragraphs(target_month),
                     )
                     pred_raw = client.chat(sys_p, usr_p)
                     pred_flags = _extract_truncation_flags(
@@ -2506,7 +2760,7 @@ def run_baseline_to_llm_format(
     output_dir: str = "llm_runs",
     fold: int = 4,
     year: int = 2024,
-    daily_test_month: int = 4,
+    daily_test_month: int = 11,
     historic_data_path: str | Path = "date/historic_data_2024.json",
     metadata: Optional[dict] = None,
     date_folder: str = "date",
@@ -2924,19 +3178,222 @@ def write_summary_table(
     return str(out_path)
 
 
+def _zone_interval_table(
+    paragraph: str,
+    metadata: dict,
+) -> List[Tuple[str, Tuple[int, int]]]:
+    """Extract one (zone_label, [a, b]) row per distinct zone mention
+    in the paragraph, deduped by axis+key+cardinal. Intervals are
+    already snapped to the 2 degC grid by extract_predictions_from_paragraph.
+    """
+    records = extract_predictions_from_paragraph(paragraph, metadata)
+    rows: List[Tuple[str, Tuple[int, int]]] = []
+    seen = set()
+    for r in records:
+        key = (r.get("axis"), r.get("key"), r.get("cardinal"))
+        if key in seen:
+            continue
+        seen.add(key)
+        z = {
+            "axis": r["axis"],
+            "ident": r.get("ident") or r.get("key"),
+            "cardinal": r.get("cardinal"),
+        }
+        label = zone_label_romanian(z)
+        a, b = r["interval"]
+        rows.append((label, (int(a), int(b))))
+    return rows
+
+
+def _render_zone_table(ax, rows: List[Tuple[str, Tuple[int, int]]], title: str):
+    """Render a list of (zone, interval) pairs as a tabular text block."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_linewidth(0.6)
+    if not rows:
+        ax.text(
+            0.05, 0.95, "(no parseable\nzone+interval pairs)",
+            transform=ax.transAxes, va="top", ha="left",
+            fontsize=8, family="monospace", color="gray",
+        )
+        ax.set_title(title, fontsize=9, loc="left")
+        return
+    # Truncate over-long zone labels so the column lines up.
+    max_label_chars = 32
+    lines = []
+    for label, (a, b) in rows:
+        short = label if len(label) <= max_label_chars else label[: max_label_chars - 1] + "."
+        lines.append(f"{short:<{max_label_chars}s}  [{a:>3d}, {b:>3d}]")
+    ax.text(
+        0.02, 0.97, "\n".join(lines),
+        transform=ax.transAxes, va="top", ha="left",
+        fontsize=7.5, family="monospace",
+    )
+    ax.set_title(title, fontsize=9, loc="left")
+
+
+def plot_top3_paragraph_comparison(
+    df: "pd.DataFrame",
+    llm_runs_dir: str | Path,
+    output_dir: str | Path,
+    metadata: dict,
+    metric: str = "manual_accuracy",
+    show: bool = False,
+) -> List[str]:
+    """
+    For each model, pick the three best-scoring evaluations by `metric`
+    and render a figure with three rows x four columns:
+
+        col 0: GT paragraph text (wrapped)
+        col 1: GT zone -> interval table (extracted via the same parser
+               manual_score uses)
+        col 2: PRED paragraph text (fluent post-processed)
+        col 3: PRED zone -> interval table
+
+    Lets you read at a glance which scenario/fold/mode combinations
+    a model is performing best on, see the prose side-by-side, and
+    audit the zone coverage / interval correctness without scrolling
+    through JSON files.
+
+    Pass `metric="judge_accuracy"` for the judge-ranked variant; the
+    output filename includes the metric so both can coexist.
+    """
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    if df.empty:
+        return written
+
+    runs_dir = Path(llm_runs_dir)
+    json_blobs: Dict[str, Dict] = {}
+    for path in sorted(runs_dir.glob("llm_runs_*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        except Exception as e:
+            print(f"  warn: failed to read {path.name}: {e}")
+            continue
+        model = (blob.get("metadata") or {}).get("model") or path.stem
+        json_blobs[model] = blob
+
+    set_metadata_for_aggregators(metadata)
+
+    for model in sorted(df["model"].dropna().unique()):
+        sub = df[(df["model"] == model) & df[metric].notna()]
+        if sub.empty:
+            continue
+        top3 = sub.nlargest(3, metric)
+        blob = json_blobs.get(model)
+        if blob is None:
+            continue
+        records = blob.get("results") or []
+
+        fig = plt.figure(figsize=(26, 22), layout="constrained")
+        gs = fig.add_gridspec(
+            nrows=3, ncols=4, width_ratios=[3.0, 1.3, 3.0, 1.3],
+        )
+        fig.suptitle(
+            f"Top 3 evaluations by {metric.replace('_', ' ')} - {model}",
+            fontsize=14, fontweight="bold",
+        )
+
+        for i, (_, row) in enumerate(top3.iterrows()):
+            rec = next(
+                (
+                    r for r in records
+                    if r.get("scenario") == row["scenario"]
+                    and r.get("fold_n") == row["fold_n"]
+                    and r.get("mode") == row["mode"]
+                    and r.get("target_month") == row["target_month"]
+                ),
+                None,
+            )
+            gt = (rec or {}).get("gt_paragraph", "") or "(missing)"
+            pred = (rec or {}).get("predicted_paragraph_fluent", "") or "(missing)"
+            manual_a = row.get("manual_accuracy")
+            judge_a = row.get("judge_accuracy")
+            run_label = (
+                f"{row['scenario']} fold_n={row['fold_n']} mode={row['mode']} "
+                f"target_month={int(row['target_month']):02d}  "
+                f"manual={('%.3f' % manual_a) if manual_a == manual_a else 'n/a'}  "
+                f"judge={('%.3f' % judge_a) if judge_a == judge_a else 'n/a'}"
+            )
+
+            ax_gt_text = fig.add_subplot(gs[i, 0])
+            ax_gt_tbl = fig.add_subplot(gs[i, 1])
+            ax_pr_text = fig.add_subplot(gs[i, 2])
+            ax_pr_tbl = fig.add_subplot(gs[i, 3])
+
+            for ax, text, side in (
+                (ax_gt_text, gt, "GROUND TRUTH"),
+                (ax_pr_text, pred, "PREDICTION (filtered)"),
+            ):
+                wrapped = textwrap.fill(text, width=80)
+                ax.text(
+                    0.02, 0.97, wrapped,
+                    transform=ax.transAxes,
+                    va="top", ha="left",
+                    fontsize=9, family="serif",
+                )
+                ax.set_title(f"{side}\n{run_label}", fontsize=10, loc="left")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for s in ax.spines.values():
+                    s.set_linewidth(0.6)
+
+            _render_zone_table(
+                ax_gt_tbl, _zone_interval_table(gt, metadata),
+                title="GT zones -> [a, b]",
+            )
+            _render_zone_table(
+                ax_pr_tbl, _zone_interval_table(pred, metadata),
+                title="PRED zones -> [a, b]",
+            )
+
+        out_path = out_dir / (
+            f"top3_comparison_{_model_id_for_filename(model)}_by_{metric}.png"
+        )
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+    return written
+
+
 def plot_all(
     llm_runs_dir: str | Path = "llm_runs",
     output_dir: str | Path = "llm_runs/plots",
     show: bool = False,
+    metadata: Optional[dict] = None,
+    date_folder: str | Path = "date",
 ) -> Dict:
-    """Convenience wrapper: aggregate + write all three artefacts."""
+    """Convenience wrapper: aggregate + write every artefact. Loads
+    stations_metadata.json lazily if not provided - the top-3
+    comparison figure needs it to re-extract zone+interval tables."""
     df = aggregate_llm_runs(llm_runs_dir)
     if df.empty:
         print(f"No llm_runs_*.json in {llm_runs_dir}; skipping plots.")
         return {"rows": 0, "files": []}
+    if metadata is None:
+        metadata = load_stations_metadata(
+            Path(date_folder) / "stations_metadata.json"
+        )
     csv_path = write_summary_table(df, output_dir)
     pngs = plot_llm_accuracy_curves(df, output_dir, show=show)
     pngs += plot_manual_vs_judge(df, output_dir, show=show)
+    pngs += plot_top3_paragraph_comparison(
+        df, llm_runs_dir, output_dir, metadata,
+        metric="manual_accuracy", show=show,
+    )
+    pngs += plot_top3_paragraph_comparison(
+        df, llm_runs_dir, output_dir, metadata,
+        metric="judge_accuracy", show=show,
+    )
     if show:
         import matplotlib.pyplot as plt
         plt.show()
@@ -3007,13 +3464,26 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--historic_data_filename", type=str,
                      default="historic_data_2024.json")
     run.add_argument("--year", type=int, default=2024)
-    run.add_argument("--daily_test_month", type=int, default=4,
+    run.add_argument("--daily_test_month", type=int, default=11,
                      help="Month (1..12) to use for the daily scenario. "
-                          "Default 4 = April.")
+                          "Default 11 = November (gives the longest in-year "
+                          "historic context: Jan..Oct).")
     run.add_argument("--output_dir", type=str, default="llm_runs",
                      help="Directory for per-model JSON outputs.")
     run.add_argument("--modes", type=str, nargs="*", default=None,
-                     help=f"Subset of modes to run. Defaults to all five: {list(MODES)}.")
+                     help=f"Subset of modes to run. Defaults to all "
+                          f"{len(MODES)}: {list(MODES)}.")
+    run.add_argument("--n_prior_years", type=int, default=3,
+                     help="How many years BEFORE --year contribute "
+                          "target-month ANM paragraphs to the user "
+                          "prompt of the three *_with_prior modes. "
+                          "Counting down from --year: with --year 2024 "
+                          "and --n_prior_years 2, paragraphs for the "
+                          "target month from 2023 and 2022 are loaded. "
+                          "Missing historic_data_<year>.json files are "
+                          "silently skipped. Set to 0 to disable the "
+                          "*_with_prior modes entirely (they're then "
+                          "filtered out of --modes). Default 3.")
 
     plot = subs.add_parser(
         "plot",
@@ -3026,6 +3496,11 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                            "(defaults to <llm_runs_dir>/plots).")
     plot.add_argument("--show", action="store_true",
                       help="Also call plt.show() after writing files.")
+    plot.add_argument("--date_folder", type=str, default="date",
+                      help="Folder holding stations_metadata.json. "
+                           "The top-3 comparison figure re-extracts "
+                           "zone+interval tables from GT and PRED "
+                           "paragraphs via this metadata.")
 
     baseline_eval = subs.add_parser(
         "baseline_eval",
@@ -3044,11 +3519,11 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                                help="Which fold's checkpoint to evaluate "
                                     "(default 4 - the deployable model).")
     baseline_eval.add_argument("--year", type=int, default=2024)
-    baseline_eval.add_argument("--daily_test_month", type=int, default=4,
+    baseline_eval.add_argument("--daily_test_month", type=int, default=11,
                                help="Month (1..12) to evaluate. Must match "
                                     "the daily_test_month used in the LLM "
                                     "runs so the comparison is apples-to-"
-                                    "apples. Default 4 = April.")
+                                    "apples. Default 11 = November.")
     baseline_eval.add_argument("--date_folder", type=str, default="date")
     baseline_eval.add_argument("--historic_data_filename", type=str,
                                default="historic_data_2024.json")
@@ -3114,6 +3589,7 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
             llm_runs_dir=args.llm_runs_dir,
             output_dir=output_dir,
             show=args.show,
+            date_folder=args.date_folder if hasattr(args, "date_folder") else "date",
         )
         print(f"Aggregated {result['rows']} rows across all llm_runs_*.json files.")
         print("Wrote:")
@@ -3180,6 +3656,7 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
         aux_matrices=aux_matrices,
         modes=selected_modes,
         date_folder=args.date_folder,
+        n_prior_years=args.n_prior_years,
     )
     return 0
 
