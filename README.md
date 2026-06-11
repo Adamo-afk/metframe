@@ -872,6 +872,7 @@ produces a single comparison plot that includes both families.
 | `run` | Runs the (5 input modes × 7 folds) test matrix for **one** Ollama LLM and writes a per-model JSON for the plotter | `llm_runs/llm_runs_<model>.json` plus, if any prompt truncates or any output is cut off, an append-only line in `llm_runs/logs/token_limits_<model>.log` |
 | `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known days of the target month (default November, matches the LLM runner's `daily_test_month`), synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
 | `postprocess` | Re-applies the fluent-Romanian rewriter over every `llm_runs_*.json` without rerunning any LLM. Useful for iterating on the rewriter (quantifier handling, snapping, unit formats) once raw paragraphs are already on disk | Updates `predicted_paragraph_fluent` in place; optionally writes `.json.bak` backups |
+| `judge_compare` | Intersects two `llm_runs_*` directories (one run with `--judge_style zero_shot`, one with `--judge_style cot`) on model name and emits comparison artefacts | `judge_compare_plots/summary_judge_compare.csv`, `accuracy_curves_zero_shot_vs_cot_{monthly,daily}.png`, `judge_style_side_by_side_<model>.png` |
 | `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary, per-scenario accuracy curves vs fold size, manual-vs-judge agreement scatter, and a side-by-side top-3-paragraphs comparison per model (ranked by manual + by judge) | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png`, `llm_runs/plots/top3_comparison_<model>_by_{manual,judge}_accuracy.png` |
 
 ```
@@ -1211,6 +1212,50 @@ comfortably accommodates the two lists + the one-sentence motivation
 + the final `[N]` for typical 25–30-zone paragraphs. The key is read
 from `OPENAI_API_KEY` only — there is no fallback file, no config
 key, no hardcoded literal.
+
+**Two judge styles available.** The CoT 4-step procedure described
+above is one of two styles, selectable via `--judge_style`:
+
+| Style | What the judge does | Output cost |
+|---|---|---|
+| `cot` (default) | 4-step procedure: extract REFERINTA list + extract PREDICTIE list + write a `Motivatie:` sentence + emit `[N]` | ~10–20× more tokens, structured artefact you can inspect |
+| `zero_shot` | Compares the two paragraphs and returns a bare integer 0–100 with no reasoning | Cheapest possible; minimal latency |
+
+`zero_shot` is the ablation control — it restores the original
+judge design (single integer reply, no chain-of-thought, no
+motivation). Useful for measuring whether the structured CoT
+extraction actually improves judge calibration versus a one-shot
+gestalt score. Run both back-to-back with different `--output_dir`
+values, then call `judge_compare` to intersect them:
+
+```
+python -m prompting.utils.llm_comparison run --model gpt-oss:latest \
+    --judge_style zero_shot --output_dir llm_runs_zs
+python -m prompting.utils.llm_comparison run --model gpt-oss:latest \
+    --judge_style cot       --output_dir llm_runs_cot
+python -m prompting.utils.llm_comparison judge_compare \
+    --zero_shot_dir llm_runs_zs --cot_dir llm_runs_cot \
+    --output_dir judge_compare_plots
+```
+
+`judge_compare` writes:
+
+- `summary_judge_compare.csv` — one row per `(model, judge_style,
+  scenario, fold_n, mode)` with manual + judge accuracy side by
+  side.
+- `accuracy_curves_zero_shot_vs_cot_{monthly,daily}.png` — two-panel
+  per-scenario figure. Left panel is manual accuracy (should overlap
+  between the two styles because the LLM's prediction is the same
+  input to both judges; serves as a sanity check). Right panel is
+  judge accuracy — the line spread here is the actual zero-shot vs
+  CoT calibration difference.
+- `judge_style_side_by_side_<model>.png` — for each common model,
+  picks the top-N (default 3) evals by manual accuracy and lays out:
+  GT text + GT zone table + PRED text + PRED zone table on one row,
+  then the zero-shot judge score and the CoT judge score +
+  extracted `Motivatie:` sentence on the row beneath. Each eval gets
+  both rows, so reading the figure top-to-bottom shows what each
+  judge was deciding on and why CoT scored what it did.
 
 ```
 setx OPENAI_API_KEY "sk-..."     # one-time, persisted; reopen terminal after

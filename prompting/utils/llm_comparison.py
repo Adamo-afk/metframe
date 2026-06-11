@@ -1875,7 +1875,7 @@ def manual_score(
 # LLM-as-a-judge scorer
 # ---------------------------------------------------------------------------
 
-JUDGE_SYSTEM_PROMPT_RO = """Esti un evaluator climatic specializat. Primesti
+JUDGE_SYSTEM_PROMPT_COT_RO = """Esti un evaluator climatic specializat. Primesti
 doua paragrafe in limba romana:
 
   1) REFERINTA - adevarul, asa cum apare in arhiva ANM.
@@ -1896,7 +1896,8 @@ generat de model. Rezultatul este o a doua lista de perechi
 
 PASUL 3 - Motivatie. Scrie o singura propozitie scurta care explica
 diferentele dintre lista REFERINTA si lista PREDICTIE (zone lipsa
-sau in plus, distanta intre intervale).
+sau in plus, distanta intre intervale). Prefixeaz-o cu
+"Motivatie:" pentru a fi usor de extras.
 
 PASUL 4 - Rezultat. Pe baza celor doua liste si a motivatiei, alege
 un singur scor intreg de acuratete intre 0 si 100. Cu cat sunt mai
@@ -1910,7 +1911,7 @@ unde N este cuprins intre 0 si 100. Scrie doar [N] pe ultima linie
 ca rezultat final. Exemplu: [73]
 """
 
-JUDGE_USER_PROMPT_TEMPLATE = """REFERINTA:
+JUDGE_USER_PROMPT_COT_TEMPLATE = """REFERINTA:
 {gt}
 
 PREDICTIE:
@@ -1921,15 +1922,96 @@ linie a raspunsului tau trebuie sa fie [N], unde N este scorul de
 acuratete."""
 
 
-def build_judge_prompt(gt_paragraph: str, predicted_paragraph: str) -> Tuple[str, str]:
-    """Return (system, user) prompts for the LLM-as-a-judge scorer."""
-    return (
-        JUDGE_SYSTEM_PROMPT_RO,
-        JUDGE_USER_PROMPT_TEMPLATE.format(
-            gt=gt_paragraph.strip(),
-            pred=predicted_paragraph.strip(),
-        ),
-    )
+# Old single-shot judge prompt restored as an explicit baseline.
+# Used by --judge_style zero_shot. Both styles cohabit the same
+# llm_runs_<model>.json schema; only `metadata.judge_style` and
+# `judge_score.judge_raw_reply` differ between two runs of the same
+# model with the same predictions.
+JUDGE_SYSTEM_PROMPT_ZERO_SHOT_RO = """Esti un evaluator climatic specializat. Vei primi
+doua paragrafe:
+
+  1) Paragraful de referinta (adevarul, asa cum apare in arhiva ANM).
+  2) Paragraful generat (predictia unui model).
+
+Compara cele doua paragrafe si determina cat de exact este paragraful
+generat fata de referinta. Considera:
+
+  - Acoperirea geografica (aceleasi regiuni, zone climatice, subdiviziuni
+    cardinale sunt mentionate).
+  - Acuratețea intervalelor de temperatura (intervalele predictiei se
+    suprapun cu ce ar fi spus referinta).
+  - Consistența cu structura de caracterizare ANM.
+
+Returneaza UN SINGUR numar intreg intre 0 si 100, reprezentand procentul
+de acuratețe (100 = identice ca informație, 0 = complet gresit). NU
+adauga explicații, comentarii sau text suplimentar - DOAR numarul.
+"""
+
+JUDGE_USER_PROMPT_ZERO_SHOT_TEMPLATE = """REFERINTA:
+{gt}
+
+PREDICTIE:
+{pred}
+
+Acuratețe (0-100):"""
+
+
+JUDGE_STYLES = ("cot", "zero_shot")
+
+
+def build_judge_prompt(
+    gt_paragraph: str,
+    predicted_paragraph: str,
+    style: str = "cot",
+) -> Tuple[str, str]:
+    """Return (system, user) prompts for the LLM-as-a-judge scorer.
+    `style` is 'cot' (4-step chain-of-thought with motivation, default)
+    or 'zero_shot' (single-integer reply, no reasoning)."""
+    if style == "zero_shot":
+        sys_p = JUDGE_SYSTEM_PROMPT_ZERO_SHOT_RO
+        user_p = JUDGE_USER_PROMPT_ZERO_SHOT_TEMPLATE.format(
+            gt=gt_paragraph.strip(), pred=predicted_paragraph.strip(),
+        )
+    elif style == "cot":
+        sys_p = JUDGE_SYSTEM_PROMPT_COT_RO
+        user_p = JUDGE_USER_PROMPT_COT_TEMPLATE.format(
+            gt=gt_paragraph.strip(), pred=predicted_paragraph.strip(),
+        )
+    else:
+        raise ValueError(
+            f"judge style must be one of {JUDGE_STYLES}, got {style!r}"
+        )
+    return (sys_p, user_p)
+
+
+# Pull the motivation sentence out of a CoT judge reply. The CoT
+# prompt explicitly asks the judge to prefix its motivation line
+# with 'Motivatie:'. Falls back to the line immediately preceding
+# the final '[N]' bracket if no prefix was emitted.
+_MOTIVATION_PREFIX_RE = re.compile(
+    r"(?im)^\s*motiva[tț]ie\s*[:\-]\s*(.+?)\s*$"
+)
+
+
+def extract_judge_motivation(reply: str) -> Optional[str]:
+    """Return the judge's one-sentence motivation from a CoT reply,
+    or None for zero-shot replies / malformed CoT replies."""
+    if not reply:
+        return None
+    m = _MOTIVATION_PREFIX_RE.search(reply)
+    if m:
+        return m.group(1).strip()
+    # Fallback: take the last non-empty line before the final '[N]'.
+    lines = [ln.strip() for ln in reply.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RESULT_BRACKET_RE.search(lines[i]):
+            for j in range(i - 1, -1, -1):
+                if lines[j] and not _RESULT_BRACKET_RE.search(lines[j]):
+                    return lines[j]
+            break
+    return None
 
 
 # The new judge prompt asks for the aggregate score on the last line
@@ -2217,27 +2299,37 @@ def llm_judge_score(
     gt_paragraph: str,
     predicted_paragraph: str,
     llm_call,
+    style: str = "cot",
 ) -> Dict:
     """
     LLM-as-judge scoring. `llm_call` is a callable
     `(system_prompt, user_prompt) -> reply_text` so this function is
-    decoupled from any specific Ollama / OpenAI client.
+    decoupled from any specific Ollama / OpenAI client. `style` is
+    'cot' (default, 4-step CoT with motivation) or 'zero_shot' (single
+    integer reply).
 
     Returns:
         {
-          'judge_accuracy': float in [0, 1] | None,
-          'judge_score_int': int in [0, 100] | None,
-          'judge_raw_reply': str,
+          'judge_style':       'cot' | 'zero_shot',
+          'judge_accuracy':    float in [0, 1] | None,
+          'judge_score_int':   int in [0, 100] | None,
+          'judge_raw_reply':   str,
+          'judge_motivation':  str | None   (CoT only; None for zero_shot)
         }
     """
-    system_p, user_p = build_judge_prompt(gt_paragraph, predicted_paragraph)
+    system_p, user_p = build_judge_prompt(
+        gt_paragraph, predicted_paragraph, style=style,
+    )
     reply = llm_call(system_p, user_p)
     score_int = parse_judge_score(reply or "")
     accuracy = score_int / 100.0 if score_int is not None else None
+    motivation = extract_judge_motivation(reply) if style == "cot" else None
     return {
+        "judge_style": style,
         "judge_accuracy": accuracy,
         "judge_score_int": score_int,
         "judge_raw_reply": reply,
+        "judge_motivation": motivation,
     }
 
 
@@ -2389,6 +2481,7 @@ def run_llm_tests(
     modes: Sequence[str] = MODES,
     date_folder: str = "date",
     n_prior_years: int = 0,
+    judge_style: str = "cot",
     on_progress=None,
 ) -> Dict:
     """
@@ -2447,6 +2540,7 @@ def run_llm_tests(
         "daily_folds": list(DAILY_FOLDS),
         "modes": list(effective_modes),
         "n_prior_years": int(n_prior_years),
+        "judge_style": judge_style,
         "num_ctx": getattr(client, "num_ctx", None),
     }
     results: List[Dict] = []
@@ -2510,6 +2604,7 @@ def run_llm_tests(
                         gt_paragraph=gt_para,
                         predicted_paragraph=pred_raw,
                         llm_call=judge_client.chat,
+                        style=judge_style,
                     )
                     judge_flags = _extract_truncation_flags(
                         getattr(judge_client, "last_meta", {}) or {}, role="judge"
@@ -2784,6 +2879,7 @@ def run_baseline_to_llm_format(
     date_folder: str = "date",
     use_openai_judge: bool = False,
     judge_model: str = _OPENAI_JUDGE_DEFAULT_MODEL,
+    judge_style: str = "cot",
     device: str = "auto",
 ) -> Dict[str, Path]:
     """
@@ -2867,6 +2963,7 @@ def run_baseline_to_llm_format(
                         "n_input_channels": ck_meta["n_input_channels"],
                         "n_output_channels": ck_meta["n_output_channels"],
                         "extra_csv_filenames": ck_meta["extra_csv_filenames"],
+                        "judge_style": judge_style if use_openai_judge else None,
                     }
                 pred_paragraph = baseline_paragraph_from_predictions(
                     predictions=pred_df, zones=zones, metadata=metadata,
@@ -2883,9 +2980,12 @@ def run_baseline_to_llm_format(
                         gt_paragraph=gt_paragraph,
                         predicted_paragraph=pred_paragraph,
                         llm_call=judge_client.chat,
+                        style=judge_style,
                     )
                 else:
                     judge = {
+                        "judge_style": None,
+                        "judge_motivation": None,
                         "judge_accuracy": None,
                         "judge_score_int": None,
                         "judge_raw_reply": None,
@@ -2990,6 +3090,7 @@ def aggregate_llm_runs(
         meta = blob.get("metadata", {}) or {}
         model = meta.get("model", path.stem)
         kind = meta.get("kind", "llm")
+        run_judge_style = meta.get("judge_style")
         for r in blob.get("results", []):
             ms = r.get("manual_score") or {}
             js = r.get("judge_score") or {}
@@ -2997,6 +3098,7 @@ def aggregate_llm_runs(
             rows.append({
                 "model": model,
                 "kind": kind,
+                "judge_style": js.get("judge_style") or run_judge_style,
                 "scenario": r.get("scenario"),
                 "fold_n": r.get("fold_n"),
                 "mode": r.get("mode"),
@@ -3383,6 +3485,248 @@ def plot_top3_paragraph_comparison(
     return written
 
 
+def plot_judge_style_comparison(
+    zero_shot_dir: str | Path,
+    cot_dir: str | Path,
+    output_dir: str | Path,
+    metadata: dict,
+    show: bool = False,
+    top_n: int = 3,
+) -> Dict:
+    """
+    Compare two parallel `llm_runs_*` directories that differ only by
+    `--judge_style` (one with `zero_shot`, one with `cot`). Intersect
+    on model name (only models that appear in BOTH directories with
+    the SAME predictions are usable) and emit:
+
+      1. summary_judge_compare.csv  - flat table with two rows per
+         (model, scenario, fold, mode), one per style, plus manual.
+      2. accuracy_curves_zero_shot_vs_cot_<scenario>.png  - per-
+         scenario accuracy curves with one line per
+         (model, style). Manual curves overlap because the
+         predictions are identical; judge curves are the interesting
+         comparison.
+      3. judge_style_side_by_side_<model>.png  - top-N evals by
+         manual_accuracy for each model: GT + GT zone table + PRED +
+         PRED zone table on one row, then a row beneath showing the
+         zero-shot judge score and the CoT judge score + extracted
+         motivation.
+
+    Returns: { 'models_common': [...], 'rows': int, 'files': [...] }
+    """
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    set_metadata_for_aggregators(metadata)
+
+    df_zs = aggregate_llm_runs(zero_shot_dir).assign(judge_style="zero_shot")
+    df_ct = aggregate_llm_runs(cot_dir).assign(judge_style="cot")
+    if df_zs.empty or df_ct.empty:
+        print(f"  warn: one of the input dirs is empty "
+              f"(zero_shot={len(df_zs)} rows, cot={len(df_ct)} rows); "
+              f"skipping judge_compare.")
+        return {"models_common": [], "rows": 0, "files": []}
+
+    common = sorted(set(df_zs["model"].dropna()) & set(df_ct["model"].dropna()))
+    if not common:
+        print("  warn: no models appear in both directories; "
+              "judge_compare needs the same --model run with each "
+              "--judge_style. Skipping.")
+        return {"models_common": [], "rows": 0, "files": []}
+
+    df = pd.concat([df_zs, df_ct], ignore_index=True)
+    df = df[df["model"].isin(common)]
+    csv_path = out_dir / "summary_judge_compare.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    written.append(str(csv_path))
+    print(f"Wrote {csv_path}  ({len(df)} rows, {len(common)} common model(s))")
+
+    # ---- accuracy curves overlaid by judge style ----
+    for scenario in df["scenario"].dropna().unique():
+        sub = df[df["scenario"] == scenario]
+        if sub.empty:
+            continue
+        fig, axes = plt.subplots(
+            1, 2, figsize=(16, 6), constrained_layout=True, sharey=True,
+        )
+        fig.suptitle(
+            f"Zero-shot vs CoT judge - {scenario} scenario", fontweight="bold",
+        )
+        cmap = plt.get_cmap("tab10")
+        for ax, metric, label in (
+            (axes[0], "manual_accuracy", "Manual"),
+            (axes[1], "judge_accuracy", "Judge"),
+        ):
+            for i, model in enumerate(common):
+                for style, ls in (("zero_shot", ":"), ("cot", "-")):
+                    mask = (
+                        (sub["model"] == model)
+                        & (sub["judge_style"] == style)
+                        & sub[metric].notna()
+                    )
+                    rows = sub[mask].groupby("fold_n")[metric].mean()
+                    if rows.empty:
+                        continue
+                    ax.plot(
+                        rows.index, rows.values,
+                        color=cmap(i % 10), linestyle=ls,
+                        marker="o", markersize=4,
+                        label=f"{model} [{style}]",
+                    )
+            ax.set_title(f"{label} accuracy")
+            ax.set_xlabel("fold_n (known units)")
+            ax.set_ylabel("accuracy")
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 1)
+        axes[1].legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        out_path = out_dir / f"accuracy_curves_zero_shot_vs_cot_{scenario}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+
+    # ---- per-model side-by-side with motivation ----
+    # Reload raw JSONs to fetch gt_paragraph / predicted_paragraph_fluent
+    # / judge_motivation per (scenario, fold_n, mode, target_month).
+    def _load_records(dir_path: Path) -> Dict[str, List[Dict]]:
+        out: Dict[str, List[Dict]] = {}
+        for path in sorted(Path(dir_path).glob("llm_runs_*.json")):
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            model = (blob.get("metadata") or {}).get("model") or path.stem
+            out[model] = blob.get("results") or []
+        return out
+
+    zs_records = _load_records(Path(zero_shot_dir))
+    ct_records = _load_records(Path(cot_dir))
+
+    for model in common:
+        # Pick top-N evals by CoT manual_accuracy (manual is identical
+        # across styles, but the CoT JSON also carries motivation we
+        # want to display).
+        sub = df_ct[df_ct["model"] == model]
+        sub = sub[sub["manual_accuracy"].notna()]
+        if sub.empty:
+            continue
+        top = sub.nlargest(top_n, "manual_accuracy")
+
+        fig = plt.figure(figsize=(26, 7 * len(top)), layout="constrained")
+        gs = fig.add_gridspec(
+            nrows=2 * len(top), ncols=4,
+            width_ratios=[3.0, 1.3, 3.0, 1.3],
+            height_ratios=[3] * (2 * len(top)),
+        )
+        fig.suptitle(
+            f"Zero-shot vs CoT judge - top {top_n} evals - {model}",
+            fontsize=14, fontweight="bold",
+        )
+
+        for i, (_, row) in enumerate(top.iterrows()):
+            key = (
+                row["scenario"], row["fold_n"], row["mode"],
+                int(row["target_month"]),
+            )
+
+            def _find(records: List[Dict]) -> Optional[Dict]:
+                for r in records:
+                    if (
+                        r.get("scenario") == key[0]
+                        and r.get("fold_n") == key[1]
+                        and r.get("mode") == key[2]
+                        and r.get("target_month") == key[3]
+                    ):
+                        return r
+                return None
+
+            rec_ct = _find(ct_records.get(model, []))
+            rec_zs = _find(zs_records.get(model, []))
+            if rec_ct is None:
+                continue
+            gt = rec_ct.get("gt_paragraph", "") or "(missing)"
+            pred = rec_ct.get("predicted_paragraph_fluent", "") or "(missing)"
+            ct_js = (rec_ct.get("judge_score") or {})
+            zs_js = (rec_zs.get("judge_score") or {}) if rec_zs else {}
+            ct_score = ct_js.get("judge_accuracy")
+            zs_score = zs_js.get("judge_accuracy")
+            motivation = ct_js.get("judge_motivation") or "(no motivation parsed)"
+
+            header = (
+                f"{row['scenario']} fold_n={row['fold_n']} mode={row['mode']} "
+                f"target_month={int(row['target_month']):02d}  "
+                f"manual={row['manual_accuracy']:.3f}"
+            )
+
+            # Row 0: GT text | GT table | PRED text | PRED table
+            ax_gt_text = fig.add_subplot(gs[2 * i, 0])
+            ax_gt_tbl = fig.add_subplot(gs[2 * i, 1])
+            ax_pr_text = fig.add_subplot(gs[2 * i, 2])
+            ax_pr_tbl = fig.add_subplot(gs[2 * i, 3])
+            for ax, text, side in (
+                (ax_gt_text, gt, "GROUND TRUTH"),
+                (ax_pr_text, pred, "PREDICTION (filtered)"),
+            ):
+                wrapped = textwrap.fill(text, width=80)
+                ax.text(0.02, 0.97, wrapped, transform=ax.transAxes,
+                        va="top", ha="left", fontsize=9, family="serif")
+                ax.set_title(f"{side}\n{header}", fontsize=10, loc="left")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for s in ax.spines.values():
+                    s.set_linewidth(0.6)
+            _render_zone_table(
+                ax_gt_tbl, _zone_interval_table(gt, metadata),
+                title="GT zones -> [a, b]",
+            )
+            _render_zone_table(
+                ax_pr_tbl, _zone_interval_table(pred, metadata),
+                title="PRED zones -> [a, b]",
+            )
+
+            # Row 1: zero-shot judge result on left half, CoT judge
+            # result + motivation on right half.
+            ax_zs = fig.add_subplot(gs[2 * i + 1, 0:2])
+            ax_ct = fig.add_subplot(gs[2 * i + 1, 2:4])
+            for ax, score, label, body in (
+                (
+                    ax_zs, zs_score, "ZERO-SHOT JUDGE",
+                    f"score: {('%.3f' % zs_score) if zs_score is not None else 'n/a'}\n\n"
+                    f"(zero-shot returns only the score; no motivation)",
+                ),
+                (
+                    ax_ct, ct_score, "COT JUDGE",
+                    f"score: {('%.3f' % ct_score) if ct_score is not None else 'n/a'}\n\n"
+                    f"motivatie: {motivation}",
+                ),
+            ):
+                wrapped = textwrap.fill(body, width=80)
+                ax.text(0.02, 0.95, wrapped, transform=ax.transAxes,
+                        va="top", ha="left", fontsize=9, family="serif")
+                ax.set_title(label, fontsize=10, loc="left", fontweight="bold")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for s in ax.spines.values():
+                    s.set_linewidth(0.6)
+
+        out_path = out_dir / (
+            f"judge_style_side_by_side_{_model_id_for_filename(model)}.png"
+        )
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+
+    return {
+        "models_common": common,
+        "rows": int(len(df)),
+        "files": written,
+    }
+
+
 def plot_all(
     llm_runs_dir: str | Path = "llm_runs",
     output_dir: str | Path = "llm_runs/plots",
@@ -3508,6 +3852,16 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                           "paragraphs from 2023/2022/2021 when --year 2024. "
                           "Missing historic_data_<year>.json files are "
                           "silently skipped.")
+    run.add_argument("--judge_style", type=str, default="cot",
+                     choices=list(JUDGE_STYLES),
+                     help="Judge prompting style. 'cot' (default) is "
+                          "the 4-step chain-of-thought with motivation "
+                          "+ [N] result. 'zero_shot' restores the old "
+                          "single-integer-only prompt for an ablation "
+                          "against the CoT design. Use separate "
+                          "--output_dir per style to keep the two JSON "
+                          "families apart so `judge_compare` can later "
+                          "intersect them on model name.")
 
     plot = subs.add_parser(
         "plot",
@@ -3561,6 +3915,39 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                                default=_OPENAI_JUDGE_DEFAULT_MODEL)
     baseline_eval.add_argument("--device", type=str, default="auto",
                                choices=["auto", "cpu", "cuda"])
+    baseline_eval.add_argument("--judge_style", type=str, default="cot",
+                               choices=list(JUDGE_STYLES),
+                               help="Mirror the LLM runner's --judge_style. "
+                                    "Only relevant when --use_openai_judge "
+                                    "is set; otherwise the field stays None "
+                                    "in the bridge JSON.")
+
+    judge_compare = subs.add_parser(
+        "judge_compare",
+        help="Compare two parallel llm_runs_* directories that differ "
+             "only by --judge_style (one zero_shot, one cot). Emits a "
+             "merged summary CSV, per-scenario accuracy curves with one "
+             "line per (model, style), and a side-by-side top-N "
+             "paragraph figure per common model showing both judges' "
+             "scores plus the CoT motivation.",
+    )
+    judge_compare.add_argument("--zero_shot_dir", type=str, required=True,
+                               help="Directory holding the zero-shot run's "
+                                    "llm_runs_<model>.json files.")
+    judge_compare.add_argument("--cot_dir", type=str, required=True,
+                               help="Directory holding the CoT run's "
+                                    "llm_runs_<model>.json files.")
+    judge_compare.add_argument("--output_dir", type=str,
+                               default="judge_compare_plots",
+                               help="Where to write the comparison CSV + PNGs.")
+    judge_compare.add_argument("--top_n", type=int, default=3,
+                               help="How many top-scoring evals to render "
+                                    "in the per-model side-by-side figure.")
+    judge_compare.add_argument("--date_folder", type=str, default="date",
+                               help="For loading stations_metadata.json - "
+                                    "needed by the zone-extraction tables.")
+    judge_compare.add_argument("--show", action="store_true",
+                               help="Also call plt.show() after writing files.")
 
     postprocess = subs.add_parser(
         "postprocess",
@@ -3588,6 +3975,25 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
               f"{len(summary)} files.")
         return 0
 
+    if args.subcommand == "judge_compare":
+        metadata = load_stations_metadata(
+            Path(args.date_folder) / "stations_metadata.json"
+        )
+        result = plot_judge_style_comparison(
+            zero_shot_dir=args.zero_shot_dir,
+            cot_dir=args.cot_dir,
+            output_dir=args.output_dir,
+            metadata=metadata,
+            show=args.show,
+            top_n=args.top_n,
+        )
+        print(f"Common models: {len(result['models_common'])} "
+              f"({', '.join(result['models_common']) or '-'})")
+        print("Wrote:")
+        for f in result["files"]:
+            print(f"  {f}")
+        return 0
+
     if args.subcommand == "baseline_eval":
         metadata = load_stations_metadata(
             Path(args.date_folder) / "stations_metadata.json"
@@ -3603,6 +4009,7 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
             date_folder=args.date_folder,
             use_openai_judge=args.use_openai_judge,
             judge_model=args.judge_model,
+            judge_style=args.judge_style,
             device=args.device,
         )
         return 0
@@ -3681,6 +4088,7 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
         modes=selected_modes,
         date_folder=args.date_folder,
         n_prior_years=args.n_prior_years,
+        judge_style=args.judge_style,
     )
     return 0
 
