@@ -841,27 +841,24 @@ def load_county_daily_matrix(
 # zones back to the model in the user prompt. The model's OUTPUT is
 # expected to use natural Romanian wording too, but for input we want
 # unambiguous labels that the model can map back to its own vocabulary.
+_CARDINAL_WORDS = {"N": "nord", "S": "sud", "E": "est", "V": "vest"}
+
+
 def zone_label_romanian(zone: Dict) -> str:
     """
     Return a Romanian-language label for the zone record, suitable for
-    use in the user prompt's per-zone section headers.
+    use in the user prompt's per-zone section headers and plot row
+    labels. For the axes where the cardinal direction matters as a
+    geographic distinction (region / region_part / subregion), append
+    the cardinal word so the rendered label is unique - otherwise the
+    zone-class table collapses three distinct cardinal subdivisions
+    of e.g. Banat into three rows that all read 'Banat'.
     """
     axis = zone["axis"]
     ident = zone["ident"]
     card = zone.get("cardinal")
-    if axis == "climatic":
-        return ident
-    if axis == "region":
-        if card is None:
-            return ident
-        card_word = {"N": "nord", "S": "sud", "E": "est", "V": "vest"}[card]
-        return f"{ident} ({card_word})"
-    if axis == "region_compound":
-        return ident
-    if axis == "region_part":
-        return ident
-    if axis == "subregion":
-        return ident
+    if card is not None and axis in ("region", "region_part", "subregion"):
+        return f"{ident} ({_CARDINAL_WORDS[card]})"
     return ident
 
 
@@ -2752,6 +2749,15 @@ def _bin_2c_floor(mean_value: float, bin_width: float = 2.0) -> Tuple[float, flo
     return (float(a), float(a + bin_width))
 
 
+def _ar_rollout_cache_path(
+    ckpt_path: Path, target_month: int, year: int, n_known_days: int,
+    cache_dir: Path,
+) -> Path:
+    """Cache key: <baseline>_<label>_fold<N>_<year>-<MM>_K<K>.parquet"""
+    stem = ckpt_path.stem        # e.g. 'nbeats_wh6_aux_fold4'
+    return cache_dir / f"{stem}_{year}-{target_month:02d}_K{n_known_days}.parquet"
+
+
 def predict_baseline_full_month(
     *,
     ckpt_path: Path,
@@ -2760,6 +2766,8 @@ def predict_baseline_full_month(
     n_known_days: int,
     date_folder: str,
     device: str,
+    use_cache: bool = True,
+    cache_dir: Optional[Path] = None,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Run a one-shot AR rollout from `ckpt_path`. The input window is the
@@ -2769,10 +2777,23 @@ def predict_baseline_full_month(
     with the known days copied straight from the daily mean CSV and
     the unknown days filled by the AR predictions, so downstream code
     can aggregate per-zone over the entire month uniformly.
+
+    Cached to `<baselines_dir>/ar_rollouts/<stem>_<YYYY>-<MM>_K<K>.parquet`
+    so subsequent calls (zone-class plot, heatmap workflow, anyone else
+    asking for the same (checkpoint, target_month, K) tuple) re-use the
+    rollout instead of re-running it. Set `use_cache=False` to force a
+    fresh compute; pass `cache_dir` to relocate the cache.
     """
     import torch                                                     # noqa
     from prompting.utils.baselines import (
         load_county_matrix, load_fold_checkpoint, autoregressive_rollout,
+    )
+
+    if cache_dir is None:
+        cache_dir = ckpt_path.parent.parent / "ar_rollouts"
+    cache_dir = Path(cache_dir)
+    cache_path = _ar_rollout_cache_path(
+        ckpt_path, target_month, year, n_known_days, cache_dir,
     )
 
     payload_peek = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -2797,6 +2818,28 @@ def predict_baseline_full_month(
             extra_csv_filenames = [
                 f"daily_county_{lbl}.csv" for lbl in var_labels[1:]
             ]
+
+    if use_cache and cache_path.is_file():
+        try:
+            pred_df = pd.read_parquet(cache_path)
+            meta = {
+                "baseline": baseline_name,
+                "label": label,
+                "W": W, "H": H,
+                "n_input_channels": n_in,
+                "n_output_channels": n_out,
+                "days_known": n_known_days,
+                "days_predicted": (
+                    (pd.Timestamp(year=year, month=target_month, day=1)
+                     + pd.offsets.MonthEnd(0)).day - n_known_days
+                ),
+                "extra_csv_filenames": extra_csv_filenames,
+                "cache_hit": True,
+            }
+            return pred_df, meta
+        except Exception as e:
+            print(f"    warn: cache read failed for {cache_path.name} "
+                  f"({e}); falling back to fresh rollout.")
 
     input_matrix, target_matrix, dates, counties, _ = load_county_matrix(
         date_folder, "daily_county_mean.csv",
@@ -2865,7 +2908,16 @@ def predict_baseline_full_month(
         "days_known": n_known_days,
         "days_predicted": days_to_predict,
         "extra_csv_filenames": extra_csv_filenames,
+        "cache_hit": False,
     }
+
+    if use_cache:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            pred_df.to_parquet(cache_path)
+        except Exception as e:
+            print(f"    warn: cache write failed for {cache_path.name} "
+                  f"({e}); rollout result not persisted.")
     return pred_df, meta
 
 
