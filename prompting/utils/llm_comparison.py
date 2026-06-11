@@ -1163,6 +1163,17 @@ def build_user_prompt_monthly(
     parts = [
         f"Cunoastem caracterizarile climatice si/sau datele observate pentru "
         f"lunile {', '.join(known_labels)} {year}.",
+    ]
+    if mode in PRIOR_YEAR_MODES and prior_year_paragraphs:
+        prior_years_sorted = sorted(prior_year_paragraphs.keys(), reverse=True)
+        parts.append(
+            f"In plus, ai si caracterizarile lunii {target_label} din "
+            f"ultimii {len(prior_years_sorted)} ani "
+            f"({', '.join(str(y) for y in prior_years_sorted)}) ca "
+            f"referinta climatologica - NU adevarul pentru {year}, ci "
+            f"contextul climatologic istoric pentru aceeasi luna."
+        )
+    parts += [
         f"Genereaza paragraful de caracterizare climatica pentru luna "
         f"{target_label} {year} folosind aceleasi conventii ca in exemple.",
         "",
@@ -1270,6 +1281,17 @@ def build_user_prompt_daily(
         f"{', '.join(previous_labels) if previous_labels else '(niciuna disponibila)'} {year}, "
         f"si datele observate zilnic pentru primele {n_known_days} zile ale lunii "
         f"{target_label} {year}.",
+    ]
+    if mode in PRIOR_YEAR_MODES and prior_year_paragraphs:
+        prior_years_sorted = sorted(prior_year_paragraphs.keys(), reverse=True)
+        parts.append(
+            f"In plus, ai si caracterizarile lunii {target_label} din "
+            f"ultimii {len(prior_years_sorted)} ani "
+            f"({', '.join(str(y) for y in prior_years_sorted)}) ca "
+            f"referinta climatologica - NU adevarul pentru {year}, ci "
+            f"contextul climatologic istoric pentru aceeasi luna."
+        )
+    parts += [
         "",
         f"Genereaza paragraful de caracterizare climatica pentru INTREAGA luna "
         f"{target_label} {year}, tinand cont ca doar primele {n_known_days} zile "
