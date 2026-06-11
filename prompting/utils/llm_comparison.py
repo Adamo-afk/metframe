@@ -4013,21 +4013,35 @@ def plot_zone_class_comparison(
             ]
             if not rows:
                 continue
-            best = max(
-                rows,
-                key=lambda r: (
-                    ((r.get("manual_score") or {}).get("accuracy") or -1)
-                ),
+            # Pre-extract per-row so we can both rank by accuracy AND
+            # filter out the "model gave up" rows that have zero
+            # parseable zones. Manual scoring awards d = w = 2 for
+            # every missed station, so a zero-zone prediction lands
+            # at manual_accuracy = 0.5 - higher than any mode that
+            # actually tried with imperfect intervals. Without the
+            # filter, the picker prefers no-prediction modes and the
+            # column ends up empty.
+            ranked = []
+            for r in rows:
+                raw = r.get("predicted_paragraph_raw") or ""
+                recs = extract_predictions_from_paragraph(raw, metadata)
+                zone_intervals: Dict[Tuple, Tuple[int, int]] = {}
+                for rec in recs:
+                    key = (rec.get("axis"), rec.get("key"), rec.get("cardinal"))
+                    if key not in zone_intervals:
+                        a, b = rec["interval"]
+                        zone_intervals[key] = (int(a), int(b))
+                acc = (r.get("manual_score") or {}).get("accuracy") or -1
+                ranked.append((acc, len(zone_intervals), r, zone_intervals))
+            # Prefer modes that produced at least one parseable
+            # interval; fall back to the highest-accuracy row only
+            # if every mode for this (model, K) is empty.
+            with_zones = [t for t in ranked if t[1] > 0]
+            pool = with_zones if with_zones else ranked
+            best_acc, best_n, best_row, best_intervals = max(
+                pool, key=lambda t: t[0],
             )
-            raw = best.get("predicted_paragraph_raw") or ""
-            recs = extract_predictions_from_paragraph(raw, metadata)
-            zone_intervals: Dict[Tuple, Tuple[int, int]] = {}
-            for r in recs:
-                key = (r.get("axis"), r.get("key"), r.get("cardinal"))
-                if key not in zone_intervals:
-                    a, b = r["interval"]
-                    zone_intervals[key] = (int(a), int(b))
-            llm_cols[f"{model}\n[{best.get('mode')}]"] = zone_intervals
+            llm_cols[f"{model}\n[{best_row.get('mode')}]"] = best_intervals
 
         # Per-baseline checkpoint -> column dict for this K
         baseline_cols: Dict[str, Dict[Tuple, Tuple[int, int]]] = {}
