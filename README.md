@@ -870,7 +870,7 @@ produces a single comparison plot that includes both families.
 | Subcommand | Purpose | Output |
 |---|---|---|
 | `run` | Runs the (5 input modes × 7 folds) test matrix for **one** Ollama LLM and writes a per-model JSON for the plotter | `llm_runs/llm_runs_<model>.json` plus, if any prompt truncates or any output is cut off, an append-only line in `llm_runs/logs/token_limits_<model>.log` |
-| `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known April days, synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
+| `baseline_eval` | Walks every `_fold4.pt` checkpoint under `baselines/checkpoints/`, runs an autoregressive rollout at K∈{6, 12, 18, 24} known days of the target month (default November, matches the LLM runner's `daily_test_month`), synthesises a paragraph from per-zone aggregates, scores with the same manual + (optional) judge pipeline used for LLMs | `llm_runs/llm_runs_baseline_<baseline>_<label>.json` (one per checkpoint, schema-compatible with `run`) |
 | `postprocess` | Re-applies the fluent-Romanian rewriter over every `llm_runs_*.json` without rerunning any LLM. Useful for iterating on the rewriter (quantifier handling, snapping, unit formats) once raw paragraphs are already on disk | Updates `predicted_paragraph_fluent` in place; optionally writes `.json.bak` backups |
 | `plot` | Aggregates every `llm_runs/llm_runs_*.json` (LLMs and baselines together), writes a flat CSV summary, per-scenario accuracy curves vs fold size, manual-vs-judge agreement scatter, and a side-by-side top-3-paragraphs comparison per model (ranked by manual + by judge) | `llm_runs/plots/summary.csv`, `llm_runs/plots/llm_{manual,judge}_accuracy_{monthly,daily}.png`, `llm_runs/plots/manual_vs_judge_<model>.png`, `llm_runs/plots/top3_comparison_<model>_by_{manual,judge}_accuracy.png` |
 
@@ -1251,15 +1251,16 @@ python -c "import json; d = json.load(open('llm_runs/llm_runs_gpt-oss_latest.jso
 the W=H=6 baseline checkpoints against the **same daily-scenario
 folds** as the LLMs. The bridge:
 
-1. For each `K ∈ {6, 12, 18, 24}` known-day point on April 2024:
+1. For each `K ∈ {6, 12, 18, 24}` known-day point on November 2024
+   (the default `--daily_test_month`):
    - Locate the input window as the **last W = 6** of the K known
-     days (so K=6 uses Apr 1–6, K=12 uses Apr 7–12, …, K=24 uses
-     Apr 19–24).
+     days (so K=6 uses Nov 1–6, K=12 uses Nov 7–12, …, K=24 uses
+     Nov 19–24).
    - Run an autoregressive rollout to fill `30 − K` predicted days.
    - Splice known days (from `daily_county_mean.csv`) + predicted
      days → a `(30, 41)` full-month per-county DataFrame.
 2. For each zone in the LLM's known-month zone set (i.e. zones
-   deduped from January + February + March ANM paragraphs):
+   deduped from January through October ANM paragraphs):
    - Compute the predicted **monthly mean** across the zone's
      counties × all 30 days.
    - Snap to a 2 °C bin `[2·floor(mean/2), 2·floor(mean/2) + 2]`.
@@ -1267,7 +1268,7 @@ folds** as the LLMs. The bridge:
    the same format the LLMs are asked to emit:
    `"In <zone_label>, mediile lunare au fost cuprinse intre [a, b] °C."`
 4. Score the synthetic paragraph with `manual_score` (and optionally
-   `llm_judge_score`) against the April GT paragraph.
+   `llm_judge_score`) against the November GT paragraph.
 5. Write `llm_runs/llm_runs_baseline_<baseline>_<label>.json` with
    the same record schema as `run`. The plotter picks it up
    automatically — no flags, no extra command.
@@ -1284,10 +1285,13 @@ the same colour on the comparison curves.
 
 **Perfect-knowledge bound:** running the bridge with the GT daily
 matrix in place of any model's prediction (i.e. an oracle baseline)
-scores manual accuracy ≈ **0.56** on April 2024 (d̄ ≈ 1.57 °C). That
-0.56 is the ceiling — accuracy is bounded above 1.00 because the 2 °C
-floor anchoring discards sub-2 °C precision. Real baselines and LLMs
-sit below this line.
+scores manual accuracy ≈ **0.648** on November 2024 (d̄ ≈ 1.09 °C,
+168 intersections, 0 misses / false positives across the
+30-zone November set). That 0.648 is the ceiling — accuracy is
+bounded under 1.00 because the 2 °C floor anchoring discards
+sub-2 °C precision. Real baselines and LLMs sit below this line.
+(The April 2024 equivalent is ≈ 0.56 with d̄ ≈ 1.57 °C — the bound
+shifts with the seasonal temperature spread.)
 
 ### CLI reference — `run`
 
@@ -1308,9 +1312,10 @@ evaluation so a crash loses at most one prediction.
 | `--date_folder` | `date` | Holds `stations_metadata.json`, `temperature_*.json`, `daily_county_*.csv`, `historic_data_*.json` |
 | `--historic_data_filename` | `historic_data_2024.json` | |
 | `--year` | 2024 | |
-| `--daily_test_month` | 4 (April) | Month used for the daily scenario; consistent across folds |
+| `--daily_test_month` | 11 (November) | Month used for the daily scenario; consistent across folds. November gives the longest in-year context (Jan..Oct as prior months) |
 | `--output_dir` | `llm_runs` | Per-model JSON + token-limit log directory |
-| `--modes` | all five | Subset to run; useful for debugging |
+| `--modes` | all eight | Subset to run; useful for debugging. With `--n_prior_years 0`, the three `*_with_prior` modes are auto-filtered |
+| `--n_prior_years` | 3 | Years before `--year` whose target-month paragraphs feed the `*_with_prior` modes. Counting down: 2024 → 2023/2022/2021. Missing files silently skipped. 0 disables the prior-year modes |
 
 ### CLI reference — `baseline_eval`
 
@@ -1320,7 +1325,7 @@ evaluation so a crash loses at most one prediction.
 | `--output_dir` | `llm_runs` | Where baseline JSONs land (same dir as LLM JSONs so `plot` picks them up) |
 | `--fold` | 4 | Which fold's checkpoint to use (deployable) |
 | `--year` | 2024 | |
-| `--daily_test_month` | 4 (April) | Must match the LLM run's value |
+| `--daily_test_month` | 11 (November) | Must match the LLM run's value |
 | `--date_folder` | `date` | |
 | `--historic_data_filename` | `historic_data_2024.json` | |
 | `--use_openai_judge` | off | Also score with gpt-5-mini, mirroring the LLM eval. Manual scoring alone is usually enough for the comparison plot |
