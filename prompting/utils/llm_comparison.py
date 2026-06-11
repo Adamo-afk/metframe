@@ -4141,6 +4141,223 @@ def plot_zone_class_comparison(
     return written
 
 
+# Cache parquets are named
+# <baseline>_<label>_fold<N>_<YYYY>-<MM>_K<K>.parquet, where the label
+# part can be empty or multi-word (e.g. 'wh6_target', 'wh6_aux'). The
+# fold token is always 'fold<digit>', month is always exactly two
+# digits, K is always one or two digits with no other characters
+# trailing. Capture everything before '_fold<N>_' as baseline+label so
+# we don't have to know the closed list of label conventions.
+_AR_CACHE_NAME_RE = re.compile(
+    r"^(?P<stem>.+)_fold(?P<fold>\d+)_(?P<year>\d{4})-(?P<month>\d{2})_K(?P<K>\d+)\.parquet$"
+)
+
+
+def plot_baseline_ar_heatmaps(
+    output_dir: str | Path,
+    baselines_dir: str | Path = "baselines",
+    daily_test_month: int = 11,
+    year: int = 2024,
+    fold: int = 4,
+    daily_folds: Tuple[int, ...] = DAILY_FOLDS,
+    date_folder: str | Path = "date",
+    show: bool = False,
+) -> List[str]:
+    """
+    Per-county AR-rollout heatmap, one PNG per (baseline_stem, K)
+    cell. Reads from the parquet cache that predict_baseline_full_month
+    populated when the zone-class comparison was rendered - no GPU
+    re-rolls. Three panels:
+
+        LEFT:   signed-error heatmap (predicted - GT) over the
+                predicted-day range only (days K+1..end), rows =
+                counties sorted by per-county RMSE descending, cols =
+                day-ahead. RdBu_r diverging colormap.
+        MIDDLE: per-county stacked bar of predicted class distribution
+                across the 32-class ANM scheme.
+        RIGHT:  same for GT.
+
+    Output files: baseline_ar_heatmap_<stem>_K<K>.png in `output_dir`.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+    from prompting.utils.baselines import (
+        temp_class_edges, temp_class_labels,
+    )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+
+    cache_dir = Path(baselines_dir) / "ar_rollouts"
+    if not cache_dir.is_dir():
+        print(f"  no AR rollout cache under {cache_dir}; skipping heatmaps.")
+        return written
+
+    # Match cache files for this target month and fold.
+    matched: List[Tuple[str, int, Path]] = []  # (stem, K, path)
+    for path in sorted(cache_dir.glob("*.parquet")):
+        m = _AR_CACHE_NAME_RE.match(path.name)
+        if not m:
+            continue
+        if int(m["year"]) != year or int(m["month"]) != daily_test_month:
+            continue
+        if int(m["fold"]) != fold:
+            continue
+        K = int(m["K"])
+        if K not in daily_folds:
+            continue
+        # Strip the trailing '_fold<N>' from the stem captured by the
+        # regex so the filename + figure title use 'nbeats_wh6_aux'.
+        stem_with_fold = f"{m['stem']}_fold{m['fold']}"
+        stem = stem_with_fold[: -(len(m["fold"]) + len("_fold"))]
+        matched.append((stem, K, path))
+    if not matched:
+        print(f"  no matching AR rollouts in {cache_dir} for "
+              f"target {year}-{daily_test_month:02d} fold {fold}; "
+              "regenerate with `plot --llm_runs_dir <dir>` first.")
+        return written
+
+    # GT daily matrix, used to compute the signed-error panel against
+    # the predicted-day range only. Aligning by date so daylight-saving
+    # / leap-day issues never bite.
+    gt_matrix = load_county_daily_matrix(
+        "daily_county_mean.csv", date_folder=str(date_folder),
+    )
+    edges = temp_class_edges()
+    class_labels_list = temp_class_labels()
+    n_classes = len(class_labels_list)
+    class_cmap = plt.get_cmap("RdYlBu_r", n_classes)
+    class_colors = [class_cmap(k) for k in range(n_classes)]
+
+    for stem, K, parquet_path in matched:
+        pred_df = pd.read_parquet(parquet_path)
+        n_days_in_month = len(pred_df)
+        if K >= n_days_in_month:
+            print(f"    {stem} K={K}: nothing to plot (K >= days_in_month)")
+            continue
+        predicted = pred_df.iloc[K:]                    # days K..end
+        try:
+            gt_window = gt_matrix.loc[predicted.index, predicted.columns]
+        except KeyError:
+            print(f"    {stem} K={K}: GT matrix missing rows for "
+                  f"{predicted.index[0].date()}..{predicted.index[-1].date()}; "
+                  "skipping.")
+            continue
+        pred_np = predicted.to_numpy(dtype=float)
+        gt_np = gt_window.to_numpy(dtype=float)
+        if pred_np.shape != gt_np.shape or pred_np.size == 0:
+            continue
+
+        signed_error = pred_np - gt_np
+        per_county_rmse = np.sqrt(np.nanmean(signed_error ** 2, axis=0))
+        sort_order = np.argsort(-per_county_rmse)
+        signed_error_sorted = signed_error[:, sort_order]
+        pred_sorted = pred_np[:, sort_order]
+        gt_sorted = gt_np[:, sort_order]
+        rmse_sorted = per_county_rmse[sort_order]
+        counties_sorted = [predicted.columns[i] for i in sort_order]
+        n_county = signed_error.shape[1]
+        total_days_pred = signed_error.shape[0]
+
+        fig, (ax_heat, ax_pred, ax_gt) = plt.subplots(
+            1, 3,
+            figsize=(total_days_pred * 0.5 + 11, max(11, 0.28 * n_county + 3)),
+            gridspec_kw={"width_ratios": [3.0, 1.1, 1.1]},
+            sharey=True,
+            layout="constrained",
+        )
+
+        vmax_pc = float(np.nanmax(np.abs(signed_error))) or 1.0
+        im = ax_heat.imshow(
+            signed_error_sorted.T,
+            aspect="auto", cmap="RdBu_r",
+            vmin=-vmax_pc, vmax=vmax_pc,
+            interpolation="nearest",
+        )
+        ax_heat.set_xticks(range(total_days_pred))
+        ax_heat.set_xticklabels(
+            [predicted.index[t].strftime("%d") for t in range(total_days_pred)],
+            fontsize=8,
+        )
+        ax_heat.set_yticks(range(n_county))
+        ax_heat.set_yticklabels(counties_sorted, fontsize=7)
+        ax_heat.set_xlabel("day of month (predicted range)")
+        ax_heat.set_ylabel(
+            "county (sorted, highest AR RMSE on top)"
+        )
+        ax_heat.set_title(
+            "Signed error (prediction − GT) per county per day, degC",
+            fontweight="bold", fontsize=12, pad=22,
+        )
+        plt.colorbar(
+            im, ax=ax_heat, orientation="horizontal",
+            pad=0.08, fraction=0.04,
+            label="prediction − GT (degC)",
+        )
+
+        per_county_class_counts_pred = np.zeros((n_county, n_classes), dtype=int)
+        per_county_class_counts_gt = np.zeros((n_county, n_classes), dtype=int)
+        for c in range(n_county):
+            cp, _ = np.histogram(pred_sorted[:, c], bins=edges)
+            cg, _ = np.histogram(gt_sorted[:, c], bins=edges)
+            per_county_class_counts_pred[c] = cp
+            per_county_class_counts_gt[c] = cg
+
+        def _stack_bars(ax, class_counts, xlabel, title):
+            left = np.zeros(n_county)
+            for k in range(n_classes):
+                counts_k = class_counts[:, k]
+                ax.barh(
+                    np.arange(n_county), counts_k, left=left,
+                    color=class_colors[k], edgecolor="none",
+                    height=0.92,
+                )
+                left += counts_k
+            ax.set_xlim(0, total_days_pred)
+            ax.set_xlabel(xlabel)
+            ax.set_title(title, fontweight="bold", fontsize=12, pad=22)
+            ax.grid(True, alpha=0.3, axis="x")
+
+        _stack_bars(
+            ax_pred, per_county_class_counts_pred,
+            xlabel="number of predicted days",
+            title="Predicted class distribution per county",
+        )
+        _stack_bars(
+            ax_gt, per_county_class_counts_gt,
+            xlabel="number of observed days",
+            title="GT class distribution per county",
+        )
+        norm = mpl.colors.BoundaryNorm(np.arange(n_classes + 1) - 0.5, n_classes)
+        sm = mpl.cm.ScalarMappable(cmap=class_cmap, norm=norm)
+        cbar = fig.colorbar(
+            sm, ax=[ax_pred, ax_gt], orientation="horizontal",
+            pad=0.08, fraction=0.04, ticks=range(0, n_classes, 4),
+        )
+        cbar.ax.set_xticklabels(
+            [class_labels_list[i] for i in range(0, n_classes, 4)],
+            rotation=45, ha="right", fontsize=7,
+        )
+        cbar.set_label("temperature class (degC)", fontsize=8)
+
+        fig.suptitle(
+            f"Per-county AR heatmap: {stem}, fold {fold}\n"
+            f"target = {year}-{daily_test_month:02d}, K={K} known days "
+            f"({predicted.index[0].date()}..{predicted.index[-1].date()}, "
+            f"{total_days_pred} predicted days; county RMSE "
+            f"{rmse_sorted.min():.2f}..{rmse_sorted.max():.2f} degC)",
+            fontsize=13,
+        )
+        out_path = out_dir / f"baseline_ar_heatmap_{stem}_K{K}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+    return written
+
+
 def plot_all(
     llm_runs_dir: str | Path = "llm_runs",
     output_dir: str | Path = "llm_runs/plots",
@@ -4184,6 +4401,11 @@ def plot_all(
         daily_test_month=daily_test_month, year=year,
         fold=fold, date_folder=date_folder, device=device,
         show=show,
+    )
+    pngs += plot_baseline_ar_heatmaps(
+        output_dir=output_dir, baselines_dir=baselines_dir,
+        daily_test_month=daily_test_month, year=year, fold=fold,
+        date_folder=date_folder, show=show,
     )
     if show:
         import matplotlib.pyplot as plt
