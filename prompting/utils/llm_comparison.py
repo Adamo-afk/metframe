@@ -2077,6 +2077,19 @@ _OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434"
 _OLLAMA_DEFAULT_NUM_CTX = 36864
 _OLLAMA_DEFAULT_KEEP_ALIVE = "30m"
 _OLLAMA_DEFAULT_TEMPERATURE = 0.2
+# Hard cap on output tokens per call. The longest legitimate
+# response is ~30 zones x ~50 tokens per sentence ~= 1500 tokens,
+# so 2048 leaves headroom. Without this cap Ollama defaults to
+# num_predict=-1 (unlimited generation), and a model that fails
+# to emit an end-of-stream token will keep producing tokens until
+# it fills num_ctx -- effectively an infinite loop from the
+# caller's perspective.
+_OLLAMA_DEFAULT_NUM_PREDICT = 2048
+# Slightly higher than Ollama's default of 1.1; helps a model that
+# starts looping ('cuprinse intre [0, 2] degC cuprinse intre [0, 2]
+# degC cuprinse intre [0, 2] degC ...') break out of the loop and
+# either move on or terminate.
+_OLLAMA_DEFAULT_REPEAT_PENALTY = 1.2
 
 
 class OllamaClient:
@@ -2095,6 +2108,8 @@ class OllamaClient:
         keep_alive: str = _OLLAMA_DEFAULT_KEEP_ALIVE,
         timeout_s: int = 600,
         auth_token: Optional[str] = None,
+        num_predict: int = _OLLAMA_DEFAULT_NUM_PREDICT,
+        repeat_penalty: float = _OLLAMA_DEFAULT_REPEAT_PENALTY,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -2103,6 +2118,8 @@ class OllamaClient:
         self.keep_alive = keep_alive
         self.timeout_s = timeout_s
         self.auth_token = auth_token
+        self.num_predict = num_predict
+        self.repeat_penalty = repeat_penalty
         self.last_meta: Dict = {}
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
@@ -2131,6 +2148,8 @@ class OllamaClient:
             "options": {
                 "num_ctx": self.num_ctx,
                 "temperature": self.temperature,
+                "num_predict": self.num_predict,
+                "repeat_penalty": self.repeat_penalty,
             },
             "stream": False,
             "keep_alive": self.keep_alive,
@@ -3820,6 +3839,26 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                      help=f"Ollama keep_alive (default {_OLLAMA_DEFAULT_KEEP_ALIVE}). "
                           "Keeps the model loaded in GPU between calls so the "
                           "full pass doesn't pay reload cost on every iteration.")
+    run.add_argument("--num_predict", type=int,
+                     default=_OLLAMA_DEFAULT_NUM_PREDICT,
+                     help=f"HARD CAP on output tokens per call (default "
+                          f"{_OLLAMA_DEFAULT_NUM_PREDICT}). Without this, "
+                          "Ollama generates until num_ctx is full when a "
+                          "model fails to emit EOS - producing the "
+                          "'infinite loop' on response. The legitimate "
+                          "longest paragraph (~30 zones x ~50 tokens) is "
+                          "around 1500 output tokens, so 2048 leaves "
+                          "comfortable headroom while bounding the worst "
+                          "case. Raise for verbose models if 'snapped=N/N' "
+                          "+ done_reason='length' starts appearing in the "
+                          "logs.")
+    run.add_argument("--repeat_penalty", type=float,
+                     default=_OLLAMA_DEFAULT_REPEAT_PENALTY,
+                     help=f"Ollama repeat_penalty (default "
+                          f"{_OLLAMA_DEFAULT_REPEAT_PENALTY}, slightly "
+                          "higher than the Ollama default of 1.1). Helps a "
+                          "model that starts looping on the same fragment "
+                          "break out and either move on or terminate.")
     run.add_argument("--date_folder", type=str, default="date",
                      help="Folder holding stations_metadata.json, temperature_*.json, "
                           "daily_county_*.csv, historic_data_*.json")
@@ -4057,6 +4096,8 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
             model=args.model, base_url=args.ollama_base_url,
             num_ctx=args.num_ctx, temperature=args.temperature,
             keep_alive=args.keep_alive,
+            num_predict=args.num_predict,
+            repeat_penalty=args.repeat_penalty,
         )
         if args.judge_provider == "openai":
             judge_model = args.judge_model or _OPENAI_JUDGE_DEFAULT_MODEL
@@ -4072,6 +4113,8 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                     model=judge_model, base_url=args.ollama_base_url,
                     num_ctx=args.num_ctx, temperature=args.temperature,
                     keep_alive=args.keep_alive,
+                    num_predict=args.num_predict,
+                    repeat_penalty=args.repeat_penalty,
                 )
             print(f"Judge: Ollama, model={judge_model}")
 
