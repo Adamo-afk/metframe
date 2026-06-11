@@ -2782,7 +2782,21 @@ def predict_baseline_full_month(
     n_out = payload_peek["model_init_kwargs"]["n_output_channels"]
     baseline_name = payload_peek["baseline"]
     label = payload_peek.get("label", "")
+    # The top-level extra_csv_filenames key is None even for multi-
+    # variable checkpoints (training writes the spec into
+    # metadata.variable_labels and forgets to mirror it up here).
+    # Derive it from variable_labels instead: the first label is the
+    # target ('mean_temp' -> daily_county_mean.csv, supplied by
+    # default), every subsequent label corresponds to a
+    # daily_county_<label>.csv input.
     extra_csv_filenames = payload_peek.get("extra_csv_filenames")
+    if not extra_csv_filenames:
+        md = payload_peek.get("metadata") or {}
+        var_labels = md.get("variable_labels") or []
+        if len(var_labels) > 1:
+            extra_csv_filenames = [
+                f"daily_county_{lbl}.csv" for lbl in var_labels[1:]
+            ]
 
     input_matrix, target_matrix, dates, counties, _ = load_county_matrix(
         date_folder, "daily_county_mean.csv",
@@ -3169,17 +3183,30 @@ def plot_llm_accuracy_curves(
     df: "pd.DataFrame",
     output_dir: str | Path,
     show: bool = False,
+    kind: Optional[str] = None,
+    file_prefix: Optional[str] = None,
+    title_prefix: Optional[str] = None,
 ) -> List[str]:
     """
     Per-scenario figure: x = fold_n, y = manual_accuracy.
     One subplot per scenario; one line per (model, mode). Lines colour-
     coded by mode; one solid colour per mode (same hue across models).
-    Models distinguished by linestyle (solid for the first, dashed for
-    the second, etc.). With one model (the dry-run case) only solid
-    lines appear.
+    Models distinguished by linestyle.
 
     Writes one PNG per metric (manual + judge) per scenario, so 4 PNGs
     total when both scenarios have data and both scorers were called.
+
+    Args:
+        kind: if set ('llm' or 'baseline'), filter the df to that subset
+            so LLMs and baselines render in SEPARATE figures and the
+            legend stays readable. Leave None to render everything
+            together (legacy behaviour).
+        file_prefix: prepended to the output filename so a kind-filtered
+            run can coexist with a combined run in the same plots dir.
+            Default 'llm' when kind is None or 'llm'; 'baseline' when
+            kind == 'baseline'.
+        title_prefix: label for the figure title; defaults to a
+            humanised form of file_prefix.
     """
     import matplotlib.pyplot as plt
     out_dir = Path(output_dir)
@@ -3189,11 +3216,25 @@ def plot_llm_accuracy_curves(
         print("aggregate_llm_runs returned empty df; nothing to plot.")
         return written
 
+    if kind is not None:
+        df = df[df["kind"] == kind]
+        if df.empty:
+            print(f"  no rows of kind={kind!r}; skipping plot.")
+            return written
+
+    if file_prefix is None:
+        file_prefix = "baseline" if kind == "baseline" else "llm"
+    if title_prefix is None:
+        title_prefix = (
+            "Baseline" if kind == "baseline"
+            else ("LLM" if kind == "llm" else "LLM + baseline")
+        )
+
     cmap = plt.get_cmap("tab10")
     mode_color = {m: cmap(i) for i, m in enumerate(_MODE_ORDER)}
     models = sorted(df["model"].dropna().unique().tolist())
     model_style = {m: ls for m, ls in
-                   zip(models, ["-", "--", ":", "-."])}
+                   zip(models, ["-", "--", ":", "-.", (0, (3, 1, 1, 1))])}
 
     for metric_key, metric_label in [
         ("manual_accuracy", "manual accuracy"),
@@ -3228,17 +3269,15 @@ def plot_llm_accuracy_curves(
             ax.set_ylim(0.0, 1.0)
             ax.grid(True, alpha=0.3)
             ax.set_title(
-                f"LLM {metric_label} vs known-data quantity\n"
+                f"{title_prefix} {metric_label} vs known-data quantity\n"
                 f"scenario = {scenario}"
             )
-            # Compact legend: one entry per unique (model, mode) — keep
-            # outside the plot since 5+ entries get crowded.
             ax.legend(
                 fontsize=8, loc="center left",
                 bbox_to_anchor=(1.02, 0.5), frameon=False,
             )
             fig.tight_layout()
-            out_path = out_dir / f"llm_{metric_key}_{scenario}.png"
+            out_path = out_dir / f"{file_prefix}_{metric_key}_{scenario}.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
             written.append(str(out_path))
             print(f"Wrote {out_path}")
@@ -3426,6 +3465,13 @@ def plot_top3_paragraph_comparison(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: List[str] = []
+    if df.empty:
+        return written
+
+    # Baselines emit synthesised template paragraphs - rendering them
+    # as a "top 3 prediction prose" figure is misleading. Restrict to
+    # rows whose source was an actual LLM run.
+    df = df[df["kind"] == "llm"]
     if df.empty:
         return written
 
@@ -3779,16 +3825,273 @@ def plot_judge_style_comparison(
     }
 
 
+def _zone_key(zone: Dict) -> Tuple[str, str, Optional[str]]:
+    """Stable hashable identity for a zone record: (axis, key, cardinal)."""
+    return (zone.get("axis"), zone.get("key"), zone.get("cardinal"))
+
+
+def _zone_mean_from_pred_df(
+    zone: Dict, pred_df: "pd.DataFrame", metadata: dict,
+) -> Optional[float]:
+    """Per-zone monthly mean over (zone counties x all days in the
+    pred_df). Returns None if no overlapping counties or no finite
+    values."""
+    counties = _zone_to_counties(zone, metadata)
+    if not counties:
+        return None
+    available = [c for c in counties if c in pred_df.columns]
+    if not available:
+        return None
+    arr = pred_df[available].to_numpy(dtype=float)
+    mask = np.isfinite(arr)
+    if not mask.any():
+        return None
+    return float(arr[mask].mean())
+
+
+def plot_zone_class_comparison(
+    df: "pd.DataFrame",
+    llm_runs_dir: str | Path,
+    output_dir: str | Path,
+    metadata: dict,
+    baselines_dir: str | Path = "baselines",
+    daily_test_month: int = 11,
+    year: int = 2024,
+    daily_folds: Tuple[int, ...] = DAILY_FOLDS,
+    fold: int = 4,
+    date_folder: str | Path = "date",
+    historic_data_filename: str = "historic_data_2024.json",
+    device: str = "auto",
+    show: bool = False,
+) -> List[str]:
+    """
+    Per-fold zone-class comparison figure. Rows = zones extracted from
+    the target month's GT paragraph; columns = GT + one column per LLM
+    (best-mode-per-model from the daily fold K) + one column per
+    trained baseline checkpoint (fold N specified by `fold`). Each cell
+    is the snapped 2 degC ANM bin label, colour-coded by mean midpoint.
+
+    Baselines are evaluated at PLOT time via an in-place AR rollout
+    that splices (known days from daily_county_mean.csv + predicted
+    days from the rollout) and computes per-zone monthly means
+    directly - no synthesised paragraph, no llm_runs_baseline_*.json
+    intermediate.
+
+    One figure per K in `daily_folds`, written to
+    `<output_dir>/zone_class_comparison_K<K>.png`.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    set_metadata_for_aggregators(metadata)
+
+    historic_path = Path(date_folder) / historic_data_filename
+    if not historic_path.is_file():
+        print(f"  warn: {historic_path} not found; skipping zone-class plot.")
+        return written
+    with open(historic_path, "r", encoding="utf-8") as f:
+        paragraphs = json.load(f).get("caracterizare_lunara") or {}
+    gt_para = paragraphs.get(romanian_month_name(daily_test_month), "")
+    if not gt_para:
+        print(f"  warn: no GT paragraph for {romanian_month_name(daily_test_month)}; "
+              "skipping zone-class plot.")
+        return written
+
+    zones = dedupe_zones(extract_zones_from_text(gt_para, metadata))
+    if not zones:
+        print("  warn: no zones extracted from GT paragraph; skipping.")
+        return written
+
+    # Per-zone GT monthly mean from the same temperature_<MM>.json the
+    # manual scorer consumes.
+    T_per_station = _load_station_temperatures_for_month(
+        daily_test_month, year, date_folder=str(date_folder),
+    )
+    gt_zone_means: Dict[Tuple, Optional[float]] = {}
+    for z in zones:
+        stations = list(z.get("stations") or [])
+        vals = [T_per_station[s] for s in stations if s in T_per_station]
+        gt_zone_means[_zone_key(z)] = (sum(vals) / len(vals)) if vals else None
+
+    # Per-LLM (model -> {zone_key -> [a, b]}) extracted from the
+    # best-manual_accuracy mode at the given daily fold.
+    llm_blobs: Dict[str, Dict] = {}
+    for path in sorted(Path(llm_runs_dir).glob("llm_runs_*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        except Exception:
+            continue
+        meta = blob.get("metadata") or {}
+        if meta.get("kind", "llm") != "llm":
+            continue
+        model = meta.get("model") or path.stem
+        llm_blobs[model] = blob
+    llm_models = sorted(llm_blobs.keys())
+
+    # Baseline checkpoints at the requested fold.
+    ckpt_dir = Path(baselines_dir) / "checkpoints"
+    ckpts = (
+        sorted(ckpt_dir.glob(f"*_fold{fold}.pt")) if ckpt_dir.is_dir() else []
+    )
+
+    if device == "auto":
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+    n_zones = len(zones)
+    cmap = plt.get_cmap("RdYlBu_r")
+    norm = mcolors.Normalize(vmin=-10.0, vmax=30.0)
+    target_label = romanian_month_name(daily_test_month)
+
+    for K in daily_folds:
+        # Per-LLM extracted interval -> column dict for this K
+        llm_cols: Dict[str, Dict[Tuple, Tuple[int, int]]] = {}
+        for model in llm_models:
+            blob = llm_blobs[model]
+            rows = [
+                r for r in (blob.get("results") or [])
+                if r.get("scenario") == "daily" and r.get("fold_n") == K
+            ]
+            if not rows:
+                continue
+            best = max(
+                rows,
+                key=lambda r: (
+                    ((r.get("manual_score") or {}).get("accuracy") or -1)
+                ),
+            )
+            raw = best.get("predicted_paragraph_raw") or ""
+            recs = extract_predictions_from_paragraph(raw, metadata)
+            zone_intervals: Dict[Tuple, Tuple[int, int]] = {}
+            for r in recs:
+                key = (r.get("axis"), r.get("key"), r.get("cardinal"))
+                if key not in zone_intervals:
+                    a, b = r["interval"]
+                    zone_intervals[key] = (int(a), int(b))
+            llm_cols[f"{model}\n[{best.get('mode')}]"] = zone_intervals
+
+        # Per-baseline checkpoint -> column dict for this K
+        baseline_cols: Dict[str, Dict[Tuple, Tuple[int, int]]] = {}
+        for ckpt in ckpts:
+            try:
+                pred_df, ck_meta = predict_baseline_full_month(
+                    ckpt_path=ckpt,
+                    target_month=daily_test_month, year=year,
+                    n_known_days=K, date_folder=str(date_folder), device=device,
+                )
+            except Exception as e:
+                print(f"    K={K} {ckpt.name}: AR rollout error - {e}")
+                continue
+            zone_intervals = {}
+            for z in zones:
+                mean = _zone_mean_from_pred_df(z, pred_df, metadata)
+                if mean is None:
+                    continue
+                a, b, _ = _snap_to_2c_bin(mean, mean + 2)
+                zone_intervals[_zone_key(z)] = (a, b)
+            label = ckpt.stem.replace(f"_fold{fold}", "")  # nbeats_wh6_aux
+            baseline_cols[label] = zone_intervals
+
+        col_labels: List[str] = ["GT"] + list(llm_cols.keys()) + list(baseline_cols.keys())
+        n_cols = len(col_labels)
+        values = np.full((n_zones, n_cols), np.nan, dtype=float)
+        texts: List[List[str]] = [["" for _ in range(n_cols)] for _ in range(n_zones)]
+
+        for i, z in enumerate(zones):
+            key = _zone_key(z)
+            # GT column
+            mean = gt_zone_means.get(key)
+            if mean is not None:
+                a, b, _ = _snap_to_2c_bin(mean, mean + 2)
+                values[i, 0] = (a + b) / 2.0
+                texts[i][0] = f"[{a}, {b}]"
+            # LLM columns
+            for j, (_label, intervals) in enumerate(llm_cols.items(), start=1):
+                if key in intervals:
+                    a, b = intervals[key]
+                    values[i, j] = (a + b) / 2.0
+                    texts[i][j] = f"[{a}, {b}]"
+            # Baseline columns
+            for j, (_label, intervals) in enumerate(
+                baseline_cols.items(), start=1 + len(llm_cols),
+            ):
+                if key in intervals:
+                    a, b = intervals[key]
+                    values[i, j] = (a + b) / 2.0
+                    texts[i][j] = f"[{a}, {b}]"
+
+        # Figure: wide grid, one row per zone, one col per source.
+        cell_w = 1.6
+        cell_h = 0.45
+        fig_w = max(12.0, 2.0 + cell_w * n_cols)
+        fig_h = max(6.0, 1.2 + cell_h * n_zones)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(
+            values, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest",
+        )
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels(col_labels, rotation=35, ha="right", fontsize=8)
+        ax.set_yticks(range(n_zones))
+        ax.set_yticklabels(
+            [zone_label_romanian(z) for z in zones], fontsize=8,
+        )
+        ax.set_title(
+            f"Zone-class side-by-side - {target_label} {year}, K={K} known days\n"
+            f"GT (left) vs LLMs (best mode per model at K={K}) vs baselines "
+            f"(fold {fold} AR splice)",
+            fontweight="bold", fontsize=11,
+        )
+        for i in range(n_zones):
+            for j in range(n_cols):
+                txt = texts[i][j]
+                if not txt:
+                    continue
+                v = values[i, j]
+                rgb = cmap(norm(v))
+                lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+                color = "white" if lum < 0.5 else "black"
+                ax.text(
+                    j, i, txt, ha="center", va="center",
+                    fontsize=7.5, color=color,
+                )
+        cbar = fig.colorbar(
+            im, ax=ax, orientation="vertical", pad=0.01, fraction=0.025,
+        )
+        cbar.set_label("bin midpoint (°C)", fontsize=9)
+        fig.tight_layout()
+        out_path = out_dir / f"zone_class_comparison_K{K}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        written.append(str(out_path))
+        print(f"Wrote {out_path}")
+        if not show:
+            plt.close(fig)
+    return written
+
+
 def plot_all(
     llm_runs_dir: str | Path = "llm_runs",
     output_dir: str | Path = "llm_runs/plots",
     show: bool = False,
     metadata: Optional[dict] = None,
     date_folder: str | Path = "date",
+    baselines_dir: str | Path = "baselines",
+    daily_test_month: int = 11,
+    year: int = 2024,
+    fold: int = 4,
+    device: str = "auto",
 ) -> Dict:
     """Convenience wrapper: aggregate + write every artefact. Loads
     stations_metadata.json lazily if not provided - the top-3
-    comparison figure needs it to re-extract zone+interval tables."""
+    comparison figure needs it to re-extract zone+interval tables.
+    Zone-class side-by-side figures are produced when a baselines/
+    checkpoint dir is found alongside the runs."""
     df = aggregate_llm_runs(llm_runs_dir)
     if df.empty:
         print(f"No llm_runs_*.json in {llm_runs_dir}; skipping plots.")
@@ -3798,7 +4101,8 @@ def plot_all(
             Path(date_folder) / "stations_metadata.json"
         )
     csv_path = write_summary_table(df, output_dir)
-    pngs = plot_llm_accuracy_curves(df, output_dir, show=show)
+    pngs = plot_llm_accuracy_curves(df, output_dir, show=show, kind="llm")
+    pngs += plot_llm_accuracy_curves(df, output_dir, show=show, kind="baseline")
     pngs += plot_manual_vs_judge(df, output_dir, show=show)
     pngs += plot_top3_paragraph_comparison(
         df, llm_runs_dir, output_dir, metadata,
@@ -3807,6 +4111,13 @@ def plot_all(
     pngs += plot_top3_paragraph_comparison(
         df, llm_runs_dir, output_dir, metadata,
         metric="judge_accuracy", show=show,
+    )
+    pngs += plot_zone_class_comparison(
+        df, llm_runs_dir, output_dir, metadata,
+        baselines_dir=baselines_dir,
+        daily_test_month=daily_test_month, year=year,
+        fold=fold, date_folder=date_folder, device=device,
+        show=show,
     )
     if show:
         import matplotlib.pyplot as plt
@@ -3951,6 +4262,23 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
                            "The top-3 comparison figure re-extracts "
                            "zone+interval tables from GT and PRED "
                            "paragraphs via this metadata.")
+    plot.add_argument("--baselines_dir", type=str, default="baselines",
+                      help="Directory holding checkpoints/ from the W=H=6 "
+                           "retrain. The zone-class side-by-side figure "
+                           "runs AR rollouts at plot time from each fold-N "
+                           "checkpoint here, splices known + predicted days "
+                           "into a full-month matrix, and computes per-zone "
+                           "monthly means without any synthesised paragraph.")
+    plot.add_argument("--daily_test_month", type=int, default=11,
+                      help="Month the zone-class side-by-side targets. "
+                           "Must match the daily_test_month of the LLM "
+                           "runs in --llm_runs_dir.")
+    plot.add_argument("--year", type=int, default=2024)
+    plot.add_argument("--fold", type=int, default=4,
+                      help="Baseline fold whose checkpoints feed the "
+                           "side-by-side AR rollouts (default 4 = deployable).")
+    plot.add_argument("--device", type=str, default="auto",
+                      choices=["auto", "cpu", "cuda"])
 
     baseline_eval = subs.add_parser(
         "baseline_eval",
@@ -4093,6 +4421,11 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
             output_dir=output_dir,
             show=args.show,
             date_folder=args.date_folder if hasattr(args, "date_folder") else "date",
+            baselines_dir=args.baselines_dir,
+            daily_test_month=args.daily_test_month,
+            year=args.year,
+            fold=args.fold,
+            device=args.device,
         )
         print(f"Aggregated {result['rows']} rows across all llm_runs_*.json files.")
         print("Wrote:")
