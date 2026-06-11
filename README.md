@@ -878,7 +878,7 @@ produces a single comparison plot that includes both families.
 python -m prompting.utils.llm_comparison <subcommand> [--flags]
 ```
 
-### Eight input modes × two scenarios = 56 evaluations per model
+### Five default modes × two scenarios = 35 evaluations per model (8 modes / 56 evals when prior-year context is opted in)
 
 The runner iterates a Cartesian product:
 
@@ -901,16 +901,26 @@ A "fold" here is the number of **known** historical units (months or
 days) the model sees in the user prompt — the scenario analogue of
 the baselines' `--folds` count.
 
-The three `*_with_prior` modes augment their base mode with target-
-month ANM paragraphs from the `--n_prior_years` years preceding the
-target year (default 3, counting down). With `--year 2024
---n_prior_years 3`, each `*_with_prior` user prompt has an extra
-`CARACTERIZARI ISTORICE PENTRU LUNA <X> DIN ANII ANTERIORI` section
-showing paragraphs from 2023, 2022 and 2021 (whichever
-`historic_data_<year>.json` files are present in `--date_folder`;
-missing years are silently skipped). Setting `--n_prior_years 0`
-filters the prior-year modes out of the run, falling back to the
-original 5×7 = 35-eval matrix.
+The three `*_with_prior` modes are **opt-in** via `--n_prior_years
+> 0`. With the default `--n_prior_years 0` they are auto-filtered
+out of the run so the matrix is exactly the 5×7 = 35-eval set that
+the baselines can match (no cross-year prose context the baseline
+track can't see). Pass e.g. `--n_prior_years 3` to opt in: each
+`*_with_prior` user prompt then gains an extra `CARACTERIZARI
+ISTORICE PENTRU LUNA <X> DIN ANII ANTERIORI` section showing
+target-month paragraphs from the 3 years preceding `--year`
+(2023/2022/2021 when `--year 2024`), whichever
+`historic_data_<year>.json` files exist in `--date_folder`. Missing
+years are silently skipped, so `--n_prior_years 5` with only three
+years on disk gives you three rather than erroring out.
+
+The asymmetry is deliberate. The baselines see only the numeric
+county-day matrices for the target year (2024); the LLMs' `*_with_
+prior` modes get climatological prose from prior years that has no
+baseline-side analogue. Running with `--n_prior_years 0` keeps the
+LLM-vs-baseline comparison fair; running with `--n_prior_years > 0`
+measures how much extra accuracy the prose context buys the LLM
+track on its own.
 
 The November default for the daily scenario gives the model the
 longest possible in-year context window (10 prior months of ANM
@@ -1306,7 +1316,7 @@ evaluation so a crash loses at most one prediction.
 | `--dry_run` | off | Use a mock client that returns canned Romanian paragraphs — no HTTP, no GPU. Verifies orchestration end-to-end |
 | `--ollama_base_url` | `http://localhost:11434` | |
 | `--num_ctx` | 36864 | Ollama context window. The largest user prompt the runner produces is the `*_with_prior` daily mode at K=24 with 3 prior years of November paragraphs + 10 in-year prior months + 24 days of per-zone data ≈ ~30K tokens; 36864 leaves headroom for the model's output |
-| `--n_prior_years` | 3 | How many years before `--year` contribute target-month ANM paragraphs to the three `*_with_prior` modes. Counting down: with `--year 2024 --n_prior_years 3`, paragraphs from 2023/2022/2021 are loaded. Missing files silently skipped. 0 disables the prior-year modes entirely |
+| `--n_prior_years` | 0 | Off by default — the three `*_with_prior` modes are filtered out of the run so the matrix matches what the baselines can see (apples-to-apples). Pass a positive int to opt in (e.g. `--n_prior_years 3` loads target-month paragraphs from 2023/2022/2021 when `--year 2024`); missing `historic_data_<year>.json` files are silently skipped |
 | `--temperature` | 0.2 | Low so the `[x, y]` format constraint is consistently honoured |
 | `--keep_alive` | `30m` | Keeps the model loaded in GPU between calls |
 | `--date_folder` | `date` | Holds `stations_metadata.json`, `temperature_*.json`, `daily_county_*.csv`, `historic_data_*.json` |
@@ -1314,8 +1324,8 @@ evaluation so a crash loses at most one prediction.
 | `--year` | 2024 | |
 | `--daily_test_month` | 11 (November) | Month used for the daily scenario; consistent across folds. November gives the longest in-year context (Jan..Oct as prior months) |
 | `--output_dir` | `llm_runs` | Per-model JSON + token-limit log directory |
-| `--modes` | all eight | Subset to run; useful for debugging. With `--n_prior_years 0`, the three `*_with_prior` modes are auto-filtered |
-| `--n_prior_years` | 3 | Years before `--year` whose target-month paragraphs feed the `*_with_prior` modes. Counting down: 2024 → 2023/2022/2021. Missing files silently skipped. 0 disables the prior-year modes |
+| `--modes` | base 5 | With the default `--n_prior_years 0`, the three `*_with_prior` modes are auto-filtered so the effective set is `historic_only`, `historic_plus_temp`, `historic_plus_aux`, `temp_only`, `aux_only`. Pass `--n_prior_years > 0` to unlock the full 8-mode list |
+| `--n_prior_years` | 0 | Off by default (apples-to-apples vs baselines). Positive int loads target-month paragraphs from that many preceding years and includes the `*_with_prior` modes in the run |
 
 ### CLI reference — `baseline_eval`
 

@@ -2388,7 +2388,7 @@ def run_llm_tests(
     aux_matrices: Optional[Dict[str, pd.DataFrame]] = None,
     modes: Sequence[str] = MODES,
     date_folder: str = "date",
-    n_prior_years: int = 3,
+    n_prior_years: int = 0,
     on_progress=None,
 ) -> Dict:
     """
@@ -3489,19 +3489,25 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--output_dir", type=str, default="llm_runs",
                      help="Directory for per-model JSON outputs.")
     run.add_argument("--modes", type=str, nargs="*", default=None,
-                     help=f"Subset of modes to run. Defaults to all "
-                          f"{len(MODES)}: {list(MODES)}.")
-    run.add_argument("--n_prior_years", type=int, default=3,
+                     help=f"Subset of modes to run. With the default "
+                          f"--n_prior_years 0, the three *_with_prior "
+                          f"modes are auto-filtered, so the effective "
+                          f"matrix is 5 modes x 7 folds = 35 evals - the "
+                          f"apples-to-apples comparison with the baselines. "
+                          f"Pass --n_prior_years > 0 to opt in to the full "
+                          f"{len(MODES)}-mode matrix: {list(MODES)}.")
+    run.add_argument("--n_prior_years", type=int, default=0,
                      help="How many years BEFORE --year contribute "
-                          "target-month ANM paragraphs to the user "
-                          "prompt of the three *_with_prior modes. "
-                          "Counting down from --year: with --year 2024 "
-                          "and --n_prior_years 2, paragraphs for the "
-                          "target month from 2023 and 2022 are loaded. "
+                          "target-month ANM paragraphs to the three "
+                          "*_with_prior modes. DEFAULT 0 = disabled "
+                          "(the *_with_prior modes are filtered out of "
+                          "the run, giving the strict apples-to-apples "
+                          "5-mode matrix that matches what the baselines "
+                          "can see). Opt in by passing a positive int, "
+                          "e.g. --n_prior_years 3 loads target-month "
+                          "paragraphs from 2023/2022/2021 when --year 2024. "
                           "Missing historic_data_<year>.json files are "
-                          "silently skipped. Set to 0 to disable the "
-                          "*_with_prior modes entirely (they're then "
-                          "filtered out of --modes). Default 3.")
+                          "silently skipped.")
 
     plot = subs.add_parser(
         "plot",
