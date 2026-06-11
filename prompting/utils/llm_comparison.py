@@ -1896,8 +1896,7 @@ generat de model. Rezultatul este o a doua lista de perechi
 
 PASUL 3 - Motivatie. Scrie o singura propozitie scurta care explica
 diferentele dintre lista REFERINTA si lista PREDICTIE (zone lipsa
-sau in plus, distanta intre intervale). Prefixeaz-o cu
-"Motivatie:" pentru a fi usor de extras.
+sau in plus, distanta intre intervale).
 
 PASUL 4 - Rezultat. Pe baza celor doua liste si a motivatiei, alege
 un singur scor intreg de acuratete intre 0 si 100. Cu cat sunt mai
@@ -1984,23 +1983,44 @@ def build_judge_prompt(
     return (sys_p, user_p)
 
 
-# Pull the motivation sentence out of a CoT judge reply. The CoT
-# prompt explicitly asks the judge to prefix its motivation line
-# with 'Motivatie:'. Falls back to the line immediately preceding
-# the final '[N]' bracket if no prefix was emitted.
-_MOTIVATION_PREFIX_RE = re.compile(
-    r"(?im)^\s*motiva[tț]ie\s*[:\-]\s*(.+?)\s*$"
+# Pull the motivation sentence out of a CoT judge reply. Anchored
+# on the 'PASUL 3' marker the system prompt names. Captures
+# everything between the start of PASUL 3 and the next PASUL marker
+# (PASUL 4) or, lacking that, the final '[N]' line. Section
+# prefixes like 'PASUL 3 - Motivatie', 'PASUL 3:' or a stray
+# 'Motivatie:' at the top of the captured block are stripped so the
+# returned text is the bare sentence ready for rendering.
+# Consumes the literal 'PASUL 3' header along with any inline
+# subheader the model might add ('PASUL 3:', 'PASUL 3 - Motivatie',
+# 'PASUL 3. Motivatie:'); captures everything from there until the
+# next PASUL marker, the final [N] line, or end-of-reply.
+_PASUL_3_RE = re.compile(
+    r"(?is)\bPASUL\s*3\b\s*[:\-.]*\s*"
+    r"(?:motiva[tț]ie\s*[:\-.]*\s*)?"
+    r"(.*?)"
+    r"(?=\bPASUL\s*4\b|\[\s*\d{1,3}\s*\](?:\s*$)?|\Z)"
+)
+_MOTIVATION_LEAD_RE = re.compile(
+    r"(?im)^\s*motiva[tț]ie\s*[:\-]\s*"
 )
 
 
 def extract_judge_motivation(reply: str) -> Optional[str]:
     """Return the judge's one-sentence motivation from a CoT reply,
-    or None for zero-shot replies / malformed CoT replies."""
+    or None for zero-shot replies / malformed CoT replies. Anchors
+    on the 'PASUL 3' section marker so the prompt no longer has to
+    require a 'Motivatie:' prefix in the model's output."""
     if not reply:
         return None
-    m = _MOTIVATION_PREFIX_RE.search(reply)
+    m = _PASUL_3_RE.search(reply)
     if m:
-        return m.group(1).strip()
+        body = m.group(1).strip()
+        body = _MOTIVATION_LEAD_RE.sub("", body, count=1).strip()
+        # The captured block might still contain multiple lines if
+        # the model emitted blank lines inside the section; collapse
+        # whitespace so the rendered text is one paragraph.
+        body = re.sub(r"\s+", " ", body).strip()
+        return body or None
     # Fallback: take the last non-empty line before the final '[N]'.
     lines = [ln.strip() for ln in reply.splitlines() if ln.strip()]
     if not lines:
@@ -2009,7 +2029,9 @@ def extract_judge_motivation(reply: str) -> Optional[str]:
         if _RESULT_BRACKET_RE.search(lines[i]):
             for j in range(i - 1, -1, -1):
                 if lines[j] and not _RESULT_BRACKET_RE.search(lines[j]):
-                    return lines[j]
+                    return _MOTIVATION_LEAD_RE.sub(
+                        "", lines[j], count=1,
+                    ).strip()
             break
     return None
 
@@ -3718,7 +3740,7 @@ def plot_judge_style_comparison(
                 (
                     ax_ct, ct_score, "COT JUDGE",
                     f"score: {('%.3f' % ct_score) if ct_score is not None else 'n/a'}\n\n"
-                    f"motivatie: {motivation}",
+                    f"{motivation}",
                 ),
             ):
                 wrapped = textwrap.fill(body, width=80)
