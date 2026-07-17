@@ -26,7 +26,6 @@ Every module in `prompting/utils/` after the cleanup, with its provenance.
 | `judge_evaluation.py` | LLM-as-a-judge scoring and aggregation tables; accepts `output_dir` override so the fine-tuning pipeline can direct its zero-shot judge output into `fine_tuned_llm/` | **New: combined** `llm_as_a_judge.py` + `judge_analysis_table.py` |
 | `dataset_creation.py` | Generate `train_data.json`, `test_data.json`, `test_data_zero_shot.json` | **New: combined** `generate_training_data.py` + `create_train_test_datasets.py` + `create_zero_shot_test_dataset.py` |
 | `diagnoses_formatting.py` | Extract yearly PDF diagnoses and reformat via gpt-5-mini into 5-sentence structure | Renamed from `create_dataset.py` |
-| `model_select_gui.py` | GUI for interactive model selection | Untouched |
 | `main.py` | Top-level CLI dispatcher | Edited in place |
 
 Files to delete (replaced by the modules above):

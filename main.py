@@ -13,7 +13,6 @@
 #     extract_forecasts_sequential,
 # )
 # from prompting.utils.create_prompts import test_prompt_generation
-# from prompting.utils.model_select_gui import generate_gui
 # from prompting.utils.ollama_calls import download_models_only, test_downloaded_models
 # from prompting.utils.postprocessing_romanian import create_analysis_tables
 # from prompting.utils.llm_as_a_judge import create_judge_analysis
@@ -61,20 +60,6 @@
 #     default=None,
 #     required=False,
 #     help='Number of past days to include in the data extraction as context for LLMs'
-# )
-# parser.add_argument(
-#     '--select_models',
-#     '-sm',
-#     action='store_true',
-#     help='Flag to indicate that model selection should be performed'
-# )
-# parser.add_argument(
-#     '--n_models',
-#     '-n',
-#     type=int,
-#     default=10,
-#     required=False,
-#     help='Number of models to select'
 # )
 # parser.add_argument(
 #     '--download_models',
@@ -1603,11 +1588,7 @@
 #                 print(f"  - fine_tuned_llm/results/{approach}/ (analysis results)")
 #             else:
 #                 print(f"\n❌ {approach.capitalize()} fine-tuning pipeline failed!")
-            
-#     elif args.select_models:
-#         # Call the model selection function here
-#         generate_gui(n_models=args.n_models)
-        
+
 #     else:
 #         print("No valid arguments provided.")
 #         parser.print_help()
@@ -1630,7 +1611,6 @@ from prompting.utils.prompt_construction import (
     test_prompt_generation,
     test_prompt_generation_gpt,
 )
-from prompting.utils.model_select_gui import generate_gui
 from prompting.utils.ollama_inference import download_models_only, test_downloaded_models
 from prompting.utils.response_evaluation import (
     create_analysis_tables,
@@ -1682,20 +1662,6 @@ parser.add_argument(
     default=None,
     required=False,
     help='Number of past days to include in the data extraction as context for LLMs'
-)
-parser.add_argument(
-    '--select_models',
-    '-sm',
-    action='store_true',
-    help='Flag to indicate that model selection should be performed'
-)
-parser.add_argument(
-    '--n_models',
-    '-n',
-    type=int,
-    default=10,
-    required=False,
-    help='Number of models to select'
 )
 parser.add_argument(
     '--download_models',
@@ -3249,9 +3215,6 @@ if __name__ == "__main__":
                 print(f"{approach} fine-tuning pipeline complete")
             else:
                 print(f"ERROR: {approach} fine-tuning pipeline failed")
-
-    elif args.select_models:
-        generate_gui(n_models=args.n_models)
 
     else:
         print("No valid arguments provided.")
